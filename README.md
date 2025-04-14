@@ -16,6 +16,5 @@ Download test data from [Google drive](https://drive.google.com/file/d/1DFUI_d4o
 Run:
 ```python
 python scripts/origin_retracing.py
-```
-# dvrk_calibration
-# dvrk_calibration
+
+

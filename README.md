@@ -11,6 +11,13 @@ pip install evotorch
 
 You also need to install NvDiffRast following the instructions [here](https://nvlabs.github.io/nvdiffrast/).
 
+For Linux, you may do
+```
+git clone https://github.com/NVlabs/nvdiffrast
+pip install .
+pip install ninja
+```
+
 # Calibration with differentiable rendering
 
 

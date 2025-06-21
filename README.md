@@ -6,15 +6,17 @@ conda activate diffcali
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 pip install "git+https://github.com/facebookresearch/pytorch3d.git"
+pip install evotorch
 ```
-# Calibration with differentiable rendering
 
-## Quick start:
-Download test data from [Google drive](https://drive.google.com/file/d/1DFUI_d4ouyvCbLwPtTMGt5AVkI4t26gf/view?usp=drive_link), and put it under `/data`
+You also need to install NvDiffRast following the instructions [here](https://nvlabs.github.io/nvdiffrast/).
+
+# Calibration with differentiable rendering
 
 
 Run:
-```python
-python scripts/origin_retracing.py
+```
+python scripts/sequential_tracing.py --use_nvdiffrast --use_bbox_optimizer --tracking_visualization --final_iters 500 --online_iters 20
+```
 
 

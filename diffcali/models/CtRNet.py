@@ -11,6 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')
 from diffcali.models.mesh_renderer import RobotMeshRenderer
 
 
+@torch.compile()
 def transform_mesh(cameras, mesh, R, T, t_mtx):
     """
     Transform the mesh from world space to clip space

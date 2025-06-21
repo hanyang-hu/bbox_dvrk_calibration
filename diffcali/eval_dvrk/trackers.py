@@ -669,7 +669,7 @@ class EvoTracker(Tracker):
     def __init__(
         self, model, robot_renderer, init_cTr, init_joint_angles, 
         num_iters=5, intr=None, p_local1=None, p_local2=None, 
-        stdev_init=5e-3, use_SNES=False, optimize_joint_angles=True
+        stdev_init=5e-3, use_SNES=False, optimize_joint_angles=False
     ):
         super().__init__(model, robot_renderer, init_cTr, init_joint_angles, num_iters, intr, p_local1, p_local2)
 
@@ -749,7 +749,7 @@ class EvoTracker(Tracker):
             problem=self.problem,
             stdev_init=self.stdev_init if self.optimizer is not CMAES else 1e-2,
             center_init=center_init,
-            # popsize=10,
+            popsize=50,
         )
         logger = DummyLogger(searcher, interval=1, after_first_step=True)
 

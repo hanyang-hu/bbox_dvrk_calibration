@@ -2,11 +2,59 @@ import torch
 import kornia
 import numpy as np
 
+import nvdiffrast.torch as dr
+
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from diffcali.models.mesh_renderer import RobotMeshRenderer
+
+
+def transform_mesh(cameras, mesh, R, T, t_mtx):
+    """
+    Transform the mesh from world space to clip space
+    Modified from https://github.com/NVlabs/nvdiffrast/issues/148#issuecomment-2090054967
+    """
+    # world to view transform
+    verts = mesh.verts_padded()  #  (B, N_v, 3)
+    verts_view = cameras.get_world_to_view_transform(R=R, T=T).transform_points(verts)  # (B, N_v, 3)
+    verts_view[...,  :3] *= -1 # due to PyTorch3D camera coordinate conventions
+    verts_view_home = torch.cat([verts_view, torch.ones_like(verts_view[..., [0]])], axis=-1) # (B, N_v, 4)
+
+    # projection
+    verts_clip = torch.matmul(verts_view_home, t_mtx.transpose(0, 1))
+    faces_clip = mesh.faces_padded().to(torch.int32)
+
+    return verts_clip, faces_clip
+
+
+@torch.compile()
+def transform_verts(cameras, verts, R, T, t_mtx):
+    verts_view = cameras.get_world_to_view_transform(R=R, T=T).transform_points(verts)
+    verts_view[...,  :3] *= -1 # due to PyTorch3D camera coordinate conventions
+    verts_view_home = torch.cat([verts_view, torch.ones_like(verts_view[..., [0]])], axis=-1) # (B, N_v, 4)
+
+    # projection
+    verts_clip = torch.matmul(verts_view_home, t_mtx.transpose(0, 1))
+
+    return verts_clip
+
+
+def render(glctx, pos, pos_idx, resolution: [int, int], antialiasing=False):
+    """
+    Silhouette rendering pipeline based on NvDiffRast
+    """
+    # Create color attributes
+    col = torch.ones_like(pos[..., :1], dtype=torch.float32) # (B, N_v, 1)
+    col_idx = pos_idx
+
+    # Render the mesh
+    rast_out, _ = dr.rasterize(glctx, pos, pos_idx, resolution=resolution)
+    color   , _ = dr.interpolate(col, rast_out, col_idx)
+    if antialiasing:
+        color = dr.antialias(color, rast_out, pos, pos_idx)
+    return color.squeeze(-1) # (B, H, W)
 
 
 class CtRNet(torch.nn.Module):
@@ -20,6 +68,8 @@ class CtRNet(torch.nn.Module):
         else:
             self.device = "cpu"
 
+        self.use_antialiasing = True
+
         # set up camera intrinsics
 
         self.intrinsics = np.array(
@@ -30,6 +80,29 @@ class CtRNet(torch.nn.Module):
 
         self.K = torch.tensor(self.intrinsics, device=self.device, dtype=torch.float)
         self.visibility_flags = [False, True, True, True]
+
+        # NvDiffRast configuration
+        self.glctx = dr.RasterizeCudaContext() # CUDA context (OpenGL is not available in my WSL)
+        self.resolution = (args.height, args.width)
+
+        fx, fy = -args.fx, -args.fy # negative
+        px, py = args.px, args.py
+        height, width = args.height, args.width
+        near, far = 1e-9, 1e9
+        A = (2 * fx) / width
+        B = (2 * fy) / height
+        C = (width - 2 * px) / width
+        D = (height - 2 * py) / height
+        E = (near + far) / (near - far)
+        F = (2 * near * far) / (near - far)
+        self.t_mtx = projectionMatrix = torch.tensor(
+            [
+                [A, 0, C, 0],
+                [0, B, D, 0],
+                [0, 0, E, F],
+                [0, 0, -1, 0]
+            ]
+        ).cuda().contiguous()  # (4, 4)
 
         # TODO: test
         """
@@ -140,24 +213,6 @@ class CtRNet(torch.nn.Module):
     def get_joint_angles(self, joint_angles):
         self.joint_angles = joint_angles
 
-    def setup_robot_renderer(self, mesh_files):
-        # mesh_files: list of mesh files
-        focal_length = [-self.args.fx, -self.args.fy]
-        principal_point = [self.args.px, self.args.py]
-        image_size = [self.args.height, self.args.width]
-
-        robot_renderer = RobotMeshRenderer(
-            focal_length=focal_length,
-            principal_point=principal_point,
-            image_size=image_size,
-            robot=None,
-            mesh_files=mesh_files,
-            device=self.device,
-            visibility_flags=self.visibility_flags,
-        )  # TODO: test
-
-        return robot_renderer
-
     # def from_lookat_to_pose_matrix(self, dist, elev, azim):
 
     #     R, T = look_at_view_transform(dist, elev, azim)
@@ -252,6 +307,24 @@ class CtRNet(torch.nn.Module):
 
         return pose_matrix.unsqueeze(0)
 
+    def setup_robot_renderer(self, mesh_files):
+        # mesh_files: list of mesh files
+        focal_length = [-self.args.fx, -self.args.fy]
+        principal_point = [self.args.px, self.args.py]
+        image_size = [self.args.height, self.args.width]
+
+        robot_renderer = RobotMeshRenderer(
+            focal_length=focal_length,
+            principal_point=principal_point,
+            image_size=image_size,
+            robot=None,
+            mesh_files=mesh_files,
+            device=self.device,
+            visibility_flags=self.visibility_flags,
+        )  # TODO: test
+
+        return robot_renderer
+
     def render_single_robot_mask(self, cTr, robot_mesh, robot_renderer):
         # cTr: (6)
         # img: (1, H, W)
@@ -263,46 +336,94 @@ class CtRNet(torch.nn.Module):
         # R = to_valid_R_batch(R)
         T = cTr[3:][None]  # (1, 3)
 
-        """Debugging the negative depth..."""
-        pose_matrix = self.cTr_to_pose_matrix(cTr[None])
-        pose_matrix = pose_matrix[0]
+        # """Debugging the negative depth..."""
+        # pose_matrix = self.cTr_to_pose_matrix(cTr[None])
+        # pose_matrix = pose_matrix[0]
 
-        # Extract the vertices in world/robot frame and convert them to homogeneous coordinates
-        verts = robot_mesh.verts_packed()  # (V, 3)
-        verts_hom = torch.cat(
-            [verts, torch.ones((verts.shape[0], 1), device=verts.device)], dim=1
-        )  # (V, 4)
+        # # Extract the vertices in world/robot frame and convert them to homogeneous coordinates
+        # verts = robot_mesh.verts_packed()  # (V, 3)
+        # verts_hom = torch.cat(
+        #     [verts, torch.ones((verts.shape[0], 1), device=verts.device)], dim=1
+        # )  # (V, 4)
 
-        # Transform vertices into camera coordinate frame:
-        # Assuming cTr transforms from robot/world frame to camera frame
-        verts_camera_space = (pose_matrix @ verts_hom.T).T  # (V, 4)
-        X_c = verts_camera_space[:, 0]
-        Y_c = verts_camera_space[:, 1]
-        Z_c = verts_camera_space[:, 2]
-        # print(f"checking the min z value {Z_c.min()}")
+        # # Transform vertices into camera coordinate frame:
+        # # Assuming cTr transforms from robot/world frame to camera frame
+        # verts_camera_space = (pose_matrix @ verts_hom.T).T  # (V, 4)
+        # X_c = verts_camera_space[:, 0]
+        # Y_c = verts_camera_space[:, 1]
+        # Z_c = verts_camera_space[:, 2]
+        # # print(f"checking the min z value {Z_c.min()}")
 
         if T[0, -1] < 0:
-            rendered_image = robot_renderer.silhouette_renderer(
-                meshes_world=robot_mesh, R=-R, T=-T
-            )
+            if self.args.use_nvdiffrast:
+                pos, pos_idx = transform_mesh(
+                    cameras=robot_renderer.cameras, mesh=robot_mesh,
+                    R=-R, T=-T, t_mtx=self.t_mtx
+                ) # project the batched meshes in the clip space
+                rendered_image = render(self.glctx, pos, pos_idx[0], self.resolution, self.use_antialiasing)
+            else:
+                # print("Using PyTorch3D")
+                rendered_image = robot_renderer.silhouette_renderer(
+                    meshes_world=robot_mesh, R=-R, T=-T
+                )[..., 3]
         else:
-            rendered_image = robot_renderer.silhouette_renderer(
-                meshes_world=robot_mesh, R=R, T=T
-            )
+            if self.args.use_nvdiffrast:
+                pos, pos_idx = transform_mesh(
+                    cameras=robot_renderer.cameras, mesh=robot_mesh,
+                    R=R, T=T, t_mtx=self.t_mtx
+                ) # project the batched meshes in the clip space
+                rendered_image = render(self.glctx, pos, pos_idx[0], self.resolution, self.use_antialiasing)
+            else:
+                # print("Using PyTorch3D")
+                rendered_image = robot_renderer.silhouette_renderer(
+                    meshes_world=robot_mesh, R=R, T=T
+                )[..., 3]
+                
 
         # rendered_image = robot_renderer.silhouette_renderer(meshes_world=robot_mesh, R = R, T = T)
 
         if torch.isnan(rendered_image).any():
             rendered_image = torch.nan_to_num(rendered_image)
 
-        return rendered_image[..., 3]
+        return rendered_image
+
+    def render_robot_mask_batch_nvdiffrast(self, cTr_batch, verts, faces, robot_renderer):
+        assert self.args.use_nvdiffrast, "This function is only for nvdiffrast"
+
+        B = cTr_batch.shape[0]
+
+        # 1) Convert angle-axis to rotation matrices (B,3,3), plus translation (B,3)
+        R_batched = kornia.geometry.conversions.angle_axis_to_rotation_matrix(
+            cTr_batch[:, :3]
+        )  # (B,3,3)
+        # If your renderer expects the transpose or some different orientation, do R_batched = R_batched.transpose(1,2) if needed
+        R_batched = R_batched.transpose(1, 2)
+        T_batched = cTr_batch[:, 3:]  # (B,3)
+
+        # silhouette_renderer should accept R_batched, T_batched of shape (B,3,3), (B,3)
+        # and batched_meshes of type Meshes with B items.
+        # The result typically has shape (B, H, W, 4) (RGBA).
+        negative_mask = T_batched[:, -1] < 0  # shape (B,)
+        # Where negative_mask is True, flip
+        T_batched_ = T_batched.clone()
+        T_batched_[negative_mask] = -T_batched_[negative_mask]
+
+        R_batched_ = R_batched.clone()
+        R_batched_[negative_mask] = -R_batched_[negative_mask]
+
+        pos = transform_verts(
+            cameras=robot_renderer.cameras, verts=verts,
+            R=R_batched_, T=T_batched_, t_mtx=self.t_mtx
+        ) # project the batched meshes in the clip space
+        silhouettes = render(self.glctx, pos, faces, self.resolution, self.use_antialiasing)
+
+        return silhouettes
 
     def render_robot_mask_batch(self, cTr_batch, robot_mesh, robot_renderer):
         """
         cTr_batch: (B, 6)
         Return: (B, H, W) silhouette mask in [0..1], single-pass rendering without Python for-loop.
         """
-
         B = cTr_batch.shape[0]
 
         # 1) Convert angle-axis to rotation matrices (B,3,3), plus translation (B,3)
@@ -319,7 +440,6 @@ class CtRNet(torch.nn.Module):
             B
         )  # Now we have B copies of the same geometry.
 
-        # 3) Render the batch in a single pass:
         # silhouette_renderer should accept R_batched, T_batched of shape (B,3,3), (B,3)
         # and batched_meshes of type Meshes with B items.
         # The result typically has shape (B, H, W, 4) (RGBA).
@@ -331,15 +451,26 @@ class CtRNet(torch.nn.Module):
         R_batched_ = R_batched.clone()
         R_batched_[negative_mask] = -R_batched_[negative_mask]
 
-        batched_silhouettes = robot_renderer.silhouette_renderer(
-            meshes_world=batched_meshes, R=R_batched_, T=T_batched_
-        )
+        # 3) Render the batch in a single pass:
+        if self.args.use_nvdiffrast:
+            pos, pos_idx = transform_mesh(
+                cameras=robot_renderer.cameras, mesh=batched_meshes,
+                R=R_batched_, T=T_batched_, t_mtx=self.t_mtx
+            ) # project the batched meshes in the clip space
+            silhouettes = render(self.glctx, pos, pos_idx[0], self.resolution, self.use_antialiasing)
 
-        # shape: (B, H, W, 4)
+        else:
+            # Use PyTorch3D
 
-        # 4) Extract alpha channel => silhouette (B,H,W)
-        silhouettes = batched_silhouettes[..., 3]
-        # shape (B,H,W)
+            batched_silhouettes = robot_renderer.silhouette_renderer(
+                meshes_world=batched_meshes, R=R_batched_, T=T_batched_
+            )
+
+            # shape: (B, H, W, 4)
+
+            # 4) Extract alpha channel => silhouette (B,H,W)
+            silhouettes = batched_silhouettes[..., 3]
+            # shape (B,H,W)
 
         return silhouettes
 

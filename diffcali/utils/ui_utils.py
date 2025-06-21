@@ -52,6 +52,7 @@ def get_reference_keypoints_auto(ref_img_path, num_keypoints=2):
     quality_level = 0.1     # Minimum quality of corners (lower means more corners)
     min_distance = 5         # Minimum distance between detected corners
     block_size = 15          # Size of the neighborhood considered for corner detection
+    
     corners = cv2.goodFeaturesToTrack(
         binary_mask,
         maxCorners=max_corners,
@@ -78,7 +79,7 @@ def get_reference_keypoints_auto(ref_img_path, num_keypoints=2):
     # plt.close('all')
 
     ref_keypoints = corners
-    print(f"detected keypoint shape: {ref_keypoints.shape}")  # [2, 1, 2] will squeeze 
+    # print(f"detected keypoint shape: {ref_keypoints.shape}")  # [2, 1, 2] will squeeze 
      
     return ref_keypoints.squeeze(1).tolist()  # Convert to list of tuples
 

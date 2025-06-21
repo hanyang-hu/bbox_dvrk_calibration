@@ -605,9 +605,12 @@ class BatchOptimize:
 
             # We do one forward pass => (B,H,W)
             # print(f"debugging ctr batches: {self.cTr_batch.shape}")
+            # import time
+            # start_time = time.time()
             pred_masks_b = self.model.render_robot_mask_batch(
                 self.cTr_batch, self.robot_mesh, self.robot_renderer
             )  # shape (B,H,W)
+            # print(f"Rendering time: {time.time() - start_time:.4f} seconds")
 
             ref_masks_b = self.ref_mask_b  # shape (B,H,W)
             per_sample_loss = self.batch_loss(

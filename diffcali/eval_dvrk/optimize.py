@@ -125,19 +125,19 @@ def cylinder_loss_params(detected_lines, projected_lines):
         angle_mean = avg_theta_2
     line_loss = line_loss + centerline_loss
 
-    distance_loss_1 = th.norm(detected_lines[0] - projected_lines[0]) + th.norm(
-        detected_lines[1] - projected_lines[1]
-    )
-    distance_loss_2 = th.norm(detected_lines[0] - projected_lines[1]) + th.norm(
-        detected_lines[1] - projected_lines[0]
-    )
-    centerline_loss_distance = th.norm(
-        th.mean(detected_lines, dim=0) - th.mean(projected_lines, dim=0)
-    )
-    if distance_loss_1 > distance_loss_2:
-        line_loss_distance = distance_loss_2 + centerline_loss_distance
-    else:
-        line_loss_distance = distance_loss_1 + centerline_loss_distance
+    # distance_loss_1 = th.norm(detected_lines[0] - projected_lines[0]) + th.norm(
+    #     detected_lines[1] - projected_lines[1]
+    # )
+    # distance_loss_2 = th.norm(detected_lines[0] - projected_lines[1]) + th.norm(
+    #     detected_lines[1] - projected_lines[0]
+    # )
+    # centerline_loss_distance = th.norm(
+    #     th.mean(detected_lines, dim=0) - th.mean(projected_lines, dim=0)
+    # )
+    # if distance_loss_1 > distance_loss_2:
+    #     line_loss_distance = distance_loss_2 + centerline_loss_distance
+    # else:
+    #     line_loss_distance = distance_loss_1 + centerline_loss_distance
     angle_degree = th.rad2deg(angle_mean)
     return line_loss, angle_degree
 
@@ -182,25 +182,25 @@ def keypoint_chamfer_loss(keypoints_a, keypoints_b, pts=True):
     # Align the centerline:
     centerline_loss = th.norm(th.mean(pts_a, dim=0) - th.mean(pts_b, dim=0))
 
-    """experiement on parallelism loss as well"""
-    # Parallelism constraint: Compute slopes and enforce similarity
-    if (
-        pts_a.size(0) >= 2 and pts_b.size(0) >= 2
-    ):  # Ensure at least two points in each set
-        slope_a = (pts_a[1, 1] - pts_a[0, 1]) / (pts_a[1, 0] - pts_a[0, 0] + 1e-6)
-        slope_b = (pts_b[1, 1] - pts_b[0, 1]) / (pts_b[1, 0] - pts_b[0, 0] + 1e-6)
-        parallelism_loss = th.abs(slope_a - slope_b)
+    # """experiement on parallelism loss as well"""
+    # # Parallelism constraint: Compute slopes and enforce similarity
+    # if (
+    #     pts_a.size(0) >= 2 and pts_b.size(0) >= 2
+    # ):  # Ensure at least two points in each set
+    #     slope_a = (pts_a[1, 1] - pts_a[0, 1]) / (pts_a[1, 0] - pts_a[0, 0] + 1e-6)
+    #     slope_b = (pts_b[1, 1] - pts_b[0, 1]) / (pts_b[1, 0] - pts_b[0, 0] + 1e-6)
+    #     parallelism_loss = th.abs(slope_a - slope_b)
 
-        # Calculate distances between the two points in each set
-        distance_a = th.norm(pts_a[1] - pts_a[0])  # Distance in set A
-        distance_b = th.norm(pts_b[1] - pts_b[0])  # Distance in set B
+    #     # Calculate distances between the two points in each set
+    #     distance_a = th.norm(pts_a[1] - pts_a[0])  # Distance in set A
+    #     distance_b = th.norm(pts_b[1] - pts_b[0])  # Distance in set B
 
-        # Minimize the difference between distances (distance constraint loss)
-        distance_constraint_loss = th.abs(distance_a - distance_b)
-    else:
-        parallelism_loss = th.tensor(0.0, device=keypoints_a.device)
-        distance_constraint_loss = th.tensor(0.0, device=keypoints_a.device)
-    """experiement on parallelism loss as well"""
+    #     # Minimize the difference between distances (distance constraint loss)
+    #     distance_constraint_loss = th.abs(distance_a - distance_b)
+    # else:
+    #     parallelism_loss = th.tensor(0.0, device=keypoints_a.device)
+    #     distance_constraint_loss = th.tensor(0.0, device=keypoints_a.device)
+    # """experiement on parallelism loss as well"""
 
     # print(f"debugging loss scale....{chamfer_loss, parallelism_loss, distance_constraint_loss}")
     if pts == True:
@@ -374,7 +374,10 @@ class Optimize(object):
 
         for idx in tqdm(range(iterations), desc="optimizing the pose..."):
             self.model.get_joint_angles(self.cTr_train[3])
+            # import time
+            # start_time = time.time()
             self.robot_mesh = self.robot_renderer.get_robot_mesh(self.cTr_train[3])
+            # print(f"Elapsed time for get_robot_mesh: {time.time() - start_time:.4f} seconds")
             self.optimizer.zero_grad()
 
             # Alternating optimization - Coordinate Descent
@@ -411,11 +414,16 @@ class Optimize(object):
             if idx == coarse_step_num:
                 print("Start coordinate decent.....")
 
+            # import time
+            # start_time = time.time()
+            # self.model.args.use_nvdiffrast = False
             rendered_image = self.model.render_single_robot_mask(
                 self.buildcTr(self.cTr_train, self.cTr_nontrain),
                 self.robot_mesh,
-                self.robot_renderer,
+                self.robot_renderer
             )
+            # print(f"Rendering time: {time.time() - start_time:.4f} seconds")
+            self.compute_weighting_mask(rendered_image.squeeze().shape) # compute weighting mask in advance
 
             # if grid_search == False:
             #     if idx == 0:
@@ -500,7 +508,7 @@ class Optimize(object):
 
             # scheduler.step()
 
-            if (idx + 1) % saving_interval == 0 or idx == 0 or idx == iterations - 1:
+            if ((idx + 1) % saving_interval == 0 or idx == 0 or idx == iterations - 1):
                 if not save_fig_dir is None:
                     os.makedirs(save_fig_dir, exist_ok=True)
 
@@ -528,7 +536,7 @@ class Optimize(object):
                     self.save_image_cv(overlay, save_path)
 
                 # Plot the loss curve
-            if (idx + 1) == iterations and iterations >= 1000:
+            if False and (idx + 1) == iterations and iterations >= 1000:
                 plt.figure()  # Create a new figure
                 plot_utils.curve2D(losses[: idx + 1], ["b"], "iteration", "loss")
                 plt.savefig(f"loss_curve_ir{idx}.png")
@@ -578,7 +586,7 @@ class Optimize(object):
         )
 
         # Convert to tensor
-        return th.from_numpy(weights).float()
+        self.weighting_mask = th.from_numpy(weights).float().to(self.model.device).requires_grad_(False).contiguous()
 
     def cylinder_loss(self, position, direction, pose_matrix, radius, fx, fy, cx, cy):
         """
@@ -687,9 +695,10 @@ class Optimize(object):
 
     def _loss(self, rendered_img, proj_pts, ref_pts, ld1, ld2, ld3, grid_search):
         gamma = 1
-        weighting_mask = self.compute_weighting_mask(rendered_img.squeeze().shape).to(
-            self.model.device
-        )
+        # weighting_mask = self.compute_weighting_mask(rendered_img.squeeze().shape).to(
+        #     self.model.device
+        # )
+        weighting_mask = self.weighting_mask
         # weighting_mask = th.ones_like(rendered_img.squeeze()).to(self.model.device)
         # weighting_mask = self.compute_weighting_mask(rendered_img.squeeze().shape).to(self.model.device)
         mse = self.loss(

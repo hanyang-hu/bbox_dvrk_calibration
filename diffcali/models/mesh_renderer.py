@@ -22,7 +22,9 @@ from pytorch3d.renderer import (
 
 from os.path import exists
 
-from diffcali.eval_dvrk.LND_fk import lndFK
+from diffcali.eval_dvrk.LND_fk import lndFK, batch_lndFK
+
+# import torch.multiprocessing as mp
 
 
 class RobotMeshRenderer:
@@ -52,7 +54,7 @@ class RobotMeshRenderer:
         self.visibility_flags = visibility_flags
 
         # preload the mesh to save loading time
-        for m_file in mesh_files:
+        for m_file in mesh_files: 
             assert exists(m_file)
             # preload_verts_i, preload_faces_idx_i, _ = load_obj(m_file)
             preload_verts_i, preload_faces_idx_i = load_ply(m_file)
@@ -102,6 +104,10 @@ class RobotMeshRenderer:
             ),
             shader=HardPhongShader(device=device, cameras=self.cameras, lights=lights),
         )
+
+        # # Set multiprocessing
+        # mp.set_start_method('spawn')
+        # self.pool = mp.Pool(mp.cpu_count())
 
     def set_mesh_visibility(self, visibility_flags):
         self.visibility_flags = visibility_flags
@@ -153,6 +159,8 @@ class RobotMeshRenderer:
         verts = torch.concat(verts_list, dim=0)
         faces = torch.concat(faces_list, dim=0)
 
+        # print(verts.shape, faces.shape)
+
         verts_rgb = torch.concat(verts_rgb_list, dim=0)[None]
         textures = Textures(verts_rgb=verts_rgb)
 
@@ -165,26 +173,27 @@ class RobotMeshRenderer:
 
         return robot_mesh
 
+    @torch.compile()
     def get_robot_verts_and_faces(self, joint_angle):
+        R_list, t_list = lndFK(joint_angle)
 
-        R_list, t_list = self.robot.get_joint_RT(joint_angle)
-        assert (
-            len(self.mesh_files) == R_list.shape[0]
-            and len(self.mesh_files) == t_list.shape[0]
-        )
+        # assert len(self.mesh_files) == R_list.shape[0] and len(self.mesh_files) == t_list.shape[0]
 
         verts_list = []
         faces_list = []
         verts_rgb_list = []
         verts_count = 0
-        for i in range(len(self.mesh_files)):
-            verts_i = self.preload_verts[i]
-            faces_i = self.preload_faces[i]
 
-            R = torch.tensor(R_list[i], dtype=torch.float32)
-            t = torch.tensor(t_list[i], dtype=torch.float32)
+        for i in range(len(self.mesh_files)):
+            if not self.visibility_flags[i]:
+                continue
+
+            verts_i = self.preload_verts[i].to(joint_angle.device)
+            faces_i = self.preload_faces[i].to(joint_angle.device)
+
+            R = R_list[i].clone().to(torch.float32)
+            t = t_list[i].clone().to(torch.float32)
             verts_i = verts_i @ R.T + t
-            # verts_i = (R @ verts_i.T).T + t
             faces_i = faces_i + verts_count
 
             verts_count += verts_i.shape[0]
@@ -192,12 +201,67 @@ class RobotMeshRenderer:
             verts_list.append(verts_i.to(self.device))
             faces_list.append(faces_i.to(self.device))
 
-            # Initialize each vertex to be white in color.
-            # color = torch.rand(3)
+            # # Initialize each vertex to be white in color.
+            # color = torch.rand(3).to(joint_angle.device)
             # verts_rgb_i = torch.ones_like(verts_i) * color  # (V, 3)
             # verts_rgb_list.append(verts_rgb_i.to(self.device))
 
         verts = torch.concat(verts_list, dim=0)
-        faces = torch.concat(faces_list, dim=0)
+        faces = torch.concat(faces_list, dim=0).to(torch.int32)
 
         return verts, faces
+
+    @torch.compile()
+    def batch_get_robot_verts_and_faces(self, joint_angles):
+        """
+        Batched version of the get_robot_verts_and_faces method
+        Args:
+            joint_angles: (B, N) tensor of joint angles
+        Returns:
+            verts: (B, V, 3) tensor of vertex positions
+            faces: (F, 3) tensor of face indices (same for all instances)
+        """
+        B, _ = joint_angles.shape
+        device = joint_angles.device
+
+        # 1) compute all R and t in one call: shapes [B, M, 3, 3], [B, M, 3]
+        R_list, t_list = batch_lndFK(joint_angles)  
+        R_list = R_list.to(torch.float32)
+        t_list = t_list.to(torch.float32)
+
+        # 2) precompute the global faces tensor (same for all batches)
+        faces_accum = []
+        cum_verts = 0
+        for verts_i, faces_i, vis in zip(self.preload_verts, self.preload_faces, self.visibility_flags):
+            if not vis:
+                continue
+            faces_accum.append((faces_i.to(device) + cum_verts).to(torch.int32))
+            cum_verts += verts_i.shape[0]
+        faces = torch.cat(faces_accum, dim=0)  # shape [F, 3]
+
+        # 3) transform and collect per-mesh verts across the batch
+        verts_accum = []
+        for i, (verts_i, vis) in enumerate(zip(self.preload_verts, self.visibility_flags)):
+            if not vis:
+                continue
+            # verts_i: [V_i, 3]
+            verts_i = verts_i.to(device).to(torch.float32)
+
+            # pick out the i-th transform for every batch element
+            # R_list[:, i]: [B, 3, 3],  t_list[:, i]: [B, 3]
+            Rb = R_list[:, i]        # [B, 3, 3]
+            tb = t_list[:, i]        # [B, 3]
+
+            # apply rotation and translation in batch:
+            # rotated[b] = verts_i @ Rb[b].T  --> use einsum
+            rotated = torch.einsum('vk,bwk->bvw', verts_i, Rb)  # [B, V_i, 3]
+            verts_b = rotated + tb[:, None, :]                  # [B, V_i, 3]
+
+            verts_accum.append(verts_b)
+
+        # 4) concatenate all per-mesh verts along the vertex dimension
+        verts = torch.cat(verts_accum, dim=1)  # [B, V, 3]
+
+        return verts, faces
+            
+

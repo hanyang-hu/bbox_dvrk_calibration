@@ -23,7 +23,7 @@ pip install ninja
 
 Run:
 ```
-python scripts/sequential_tracing.py --use_nvdiffrast --use_bbox_optimizer --tracking_visualization --final_iters 500 --online_iters 20
+python scripts/sequential_tracing.py --use_nvdiffrast --use_bbox_optimizer --tracking_visualization --final_iters 500 --online_iters 10
 ```
 
 

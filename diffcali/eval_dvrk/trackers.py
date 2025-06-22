@@ -8,6 +8,7 @@ import os
 
 from diffcali.eval_dvrk.LND_fk import lndFK, batch_lndFK
 from diffcali.utils.projection_utils import *
+from diffcali.utils.ui_utils import *
 from diffcali.utils.cylinder_projection_utils import (
     projectCylinderTorch,
     transform_points,
@@ -23,9 +24,13 @@ from evotorch.logging import Logger
 torch.set_default_dtype(torch.float32)
 
 
+# Loss settings
 MSE_WEIGHT = 10.0  # weight for the MSE loss
 PTS_WEIGHT = 1e-2  # weight for the keypoint loss
-CYD_WEIGHT = 2e-2  # weight for the cylinder loss
+CYD_WEIGHT = 1e-2  # weight for the cylinder loss
+
+USE_PTS_LOSS = True  # whether to use keypoint loss
+USE_CYD_LOSS = False  # whether to use cylinder loss
 
 
 def keypoint_loss_batch(keypoints_a, keypoints_b):
@@ -209,8 +214,8 @@ class GradientTracker(Tracker):
             print("[Enabling antialiasing for better gradients.]")
             self.model.use_antialiasing = True # use antialiasing for better gradients
 
-        self.kpts_loss = True
-        self.cylinder_loss = True
+        self.kpts_loss = USE_PTS_LOSS
+        self.cylinder_loss = USE_CYD_LOSS
 
         self.mse_weight = MSE_WEIGHT  # weight for the MSE loss
         self.pts_weight = PTS_WEIGHT  # weight for the keypoint loss
@@ -272,45 +277,55 @@ class GradientTracker(Tracker):
         # parallelism = angle_between_lines(projected_lines, detected_lines)
         # print(f"testing line angle...{parallelism}")
         return cylinder_loss
-
-    def track(self, mask, joint_angles, ref_keypoints=None, visualization=False):
+        
+    def track(self, mask, ref_img, joint_angles, visualization=False):
         ref_mask_np = mask.detach().cpu().numpy()
-        longest_lines = detect_lines(ref_mask_np, output=True)
 
-        longest_lines = np.array(longest_lines, dtype=np.float64)
-
-        if longest_lines.shape[0] < 2:
-            # Force skip cylinder or fallback
-            print(
-                "WARNING: Not enough lines found by Hough transform. Skipping cylinder loss."
-            )
-            # You can set self.det_line_params to None or some fallback
-            self.det_line_params = None
-
+        if self.kpts_loss:
+            ref_keypoints = get_reference_keypoints_auto(ref_img_path=None, ref_img=ref_img, num_keypoints=2)
+            ref_keypoints = torch.tensor(ref_keypoints).squeeze().float().cuda()
         else:
-            # print(f"debugging the longest lines {longest_lines}")
-            x1 = longest_lines[:, 0]
-            y1 = longest_lines[:, 1]
-            x2 = longest_lines[:, 2]
-            y2 = longest_lines[:, 3]
-            # print(f"debugging the end points x1: {x1}, y1: {y1}, x2: {x2}, y2: {y2}")
-            # Calculate line parameters (a, b, c) for detected lines
-            a = y2 - y1
-            b = x1 - x2
-            c = x1 * y2 - x2 * y1  # Determinant for the line equation
+            ref_keypoints = None
 
-            # Normalize to match the form au + bv = 1
-            # norm = c + 1e-6  # Ensure no division by zero
-            norm = np.abs(c)  # Compute the absolute value
-            norm = np.maximum(norm, 1e-6)  # Clamp to a minimum value of 1e-6
-            a /= norm
-            b /= norm
+        if self.cylinder_loss:
+            longest_lines = detect_lines(ref_mask_np, output=True) 
 
-            # Stack line parameters into a tensor and normalize to match au + bv = 1 form
-            detected_lines = torch.from_numpy(np.stack((a, b), axis=-1)).to(
-                self.model.device
-            )
-            self.det_line_params = detected_lines
+            longest_lines = np.array(longest_lines, dtype=np.float64)
+
+            if longest_lines.shape[0] < 2:
+                # Force skip cylinder or fallback
+                print(
+                    "WARNING: Not enough lines found by Hough transform. Skipping cylinder loss."
+                )
+                # You can set self.det_line_params to None or some fallback
+                self.det_line_params = None
+
+            else:
+                # print(f"debugging the longest lines {longest_lines}")
+                x1 = longest_lines[:, 0]
+                y1 = longest_lines[:, 1]
+                x2 = longest_lines[:, 2]
+                y2 = longest_lines[:, 3]
+                # print(f"debugging the end points x1: {x1}, y1: {y1}, x2: {x2}, y2: {y2}")
+                # Calculate line parameters (a, b, c) for detected lines
+                a = y2 - y1
+                b = x1 - x2
+                c = x1 * y2 - x2 * y1  # Determinant for the line equation
+
+                # Normalize to match the form au + bv = 1
+                # norm = c + 1e-6  # Ensure no division by zero
+                norm = np.abs(c)  # Compute the absolute value
+                norm = np.maximum(norm, 1e-6)  # Clamp to a minimum value of 1e-6
+                a /= norm
+                b /= norm
+
+                # Stack line parameters into a tensor and normalize to match au + bv = 1 form
+                detected_lines = torch.from_numpy(np.stack((a, b), axis=-1)).to(
+                    self.model.device
+                )
+                self.det_line_params = detected_lines
+        else:
+            self.det_line_params = None
 
         cTr = self._prev_cTr.clone()
         # joint_angles = self._prev_joint_angles.clone() # ignore the current joint angles
@@ -443,8 +458,8 @@ class PoseEstimationProblem(Problem):
         self.ref_keypoints = None
         self.det_line_params = None
 
-        self.kpts_loss = True
-        self.cylinder_loss = True
+        self.kpts_loss = USE_PTS_LOSS
+        self.cylinder_loss = USE_CYD_LOSS
 
         self.mse_weight = MSE_WEIGHT  # weight for the MSE loss
         self.pts_weight = PTS_WEIGHT  # weight for the keypoint loss
@@ -691,7 +706,6 @@ class EvoTracker(Tracker):
     def get_cylinder(self, mask):
         ref_mask_np = mask.detach().cpu().numpy()
         longest_lines = detect_lines(ref_mask_np, output=True)
-
         longest_lines = np.array(longest_lines, dtype=np.float64)
 
         if longest_lines.shape[0] < 2:
@@ -730,11 +744,14 @@ class EvoTracker(Tracker):
         return ret
 
     @torch.no_grad()
-    def track(self, mask, joint_angles, ref_keypoints=None, visualization=False):
+    def track(self, mask, ref_img, joint_angles, visualization=False):
         # Update the optimization problem
         ref_mask = mask.to(self.model.device)
-        ref_keypoints = ref_keypoints
-        det_line_params = self.get_cylinder(mask)
+        ref_keypoints = None
+        if self.problem.kpts_loss:
+            ref_keypoints = get_reference_keypoints_auto(ref_img_path=None, ref_img=ref_img, num_keypoints=2)
+            ref_keypoints = torch.tensor(ref_keypoints).squeeze().float().cuda()
+        det_line_params = self.get_cylinder(mask) if self.problem.cylinder_loss else None
         self.problem.update_problem(
             ref_mask, ref_keypoints, det_line_params, joint_angles
         )

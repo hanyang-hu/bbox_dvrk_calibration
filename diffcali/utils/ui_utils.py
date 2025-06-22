@@ -42,8 +42,12 @@ def get_reference_keypoints(image, num_keypoints=2):
     return params["keypoints"]
 
 
-def get_reference_keypoints_auto(ref_img_path, num_keypoints=2):
-    cv_img = cv2.imread(ref_img_path)
+def get_reference_keypoints_auto(ref_img_path, num_keypoints=2, ref_img=None):
+    # Read data
+    if ref_img_path is None and ref_img is None:
+        raise ValueError("Either ref_img_path or ref_mask must be provided.")
+    cv_img = ref_img if ref_img_path is None else cv2.imread(ref_img_path)
+
     cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
     ref_img = cv2.inRange(cv_img, np.ones(3) * 128, np.ones(3) * 255) 
     binary_mask = ref_img.astype(np.uint8)

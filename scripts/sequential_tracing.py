@@ -166,6 +166,7 @@ def read_data(args):
 
         data = {
             # "frame": frame,
+            "ref_img": cv2.imread(ref_mask_path),
             "ref_mask": ref_mask.clone(),
             "ref_mask_path": ref_mask_path,
             "ref_keypoints": ref_keypoints.clone(),
@@ -504,12 +505,15 @@ if __name__ == "__main__":
         # print(data_lst[i]["joint_angles"])
 
         start_time = time.time()
+
+        # Track the current frame
         cTr, joint_angles, loss, overlay = tracker.track(
             mask=data_lst[i]["ref_mask"],
+            ref_img=data_lst[i]["ref_img"], # for cv2 operatiosn
             joint_angles=data_lst[i]["joint_angles"],
-            ref_keypoints=data_lst[i]["ref_keypoints"],
             visualization=args.tracking_visualization,
         )
+
         end_time = time.time()
 
         # Save the overlay image

@@ -328,17 +328,36 @@ class GradientTracker(Tracker):
             self.det_line_params = None
 
         cTr = self._prev_cTr.clone()
+        axis, xyz = cTr[:3], cTr[3:]  # split the cTr into axis and xyz
         # joint_angles = self._prev_joint_angles.clone() # ignore the current joint angles
 
-        cTr.requires_grad = True
+        axis.requires_grad = True
+        xyz.requires_grad = True
         joint_angles.requires_grad = True
 
-        optimizer = torch.optim.Adam([cTr, joint_angles], lr=self.lr)
+        optimizer = torch.optim.Adam(
+            [
+                {
+                    "params": axis,
+                    "lr": self.lr * 50.,
+                },
+                {
+                    "params": xyz,
+                    "lr": self.lr,
+                },
+                {
+                    "params": joint_angles,
+                    "lr": self.lr,
+                },
+            ]
+        )   
 
         for _ in range(self.num_iters):
             optimizer.zero_grad()
 
             self.robot_mesh = self.robot_renderer.get_robot_mesh(joint_angles) 
+
+            cTr = th.cat((axis, xyz), dim=0)  # concatenate axis and xyz to form cTr
 
             rendered_mask = self.model.render_single_robot_mask(cTr, self.robot_mesh, self.robot_renderer).squeeze(0) 
 
@@ -399,6 +418,7 @@ class GradientTracker(Tracker):
             optimizer.step()
 
         # Save the current cTr and joint angles for the next iteration
+        cTr = th.cat((axis, xyz), dim=0)  # concatenate axis and xyz to form cTr
         self._prev_cTr = cTr.detach()
         self._prev_joint_angles = joint_angles.detach()
 
@@ -684,7 +704,7 @@ class EvoTracker(Tracker):
     def __init__(
         self, model, robot_renderer, init_cTr, init_joint_angles, 
         num_iters=5, intr=None, p_local1=None, p_local2=None, 
-        stdev_init=5e-3, use_SNES=False, optimize_joint_angles=False
+        stdev_init=5e-3, use_SNES=False, optimize_joint_angles=True
     ):
         super().__init__(model, robot_renderer, init_cTr, init_joint_angles, num_iters, intr, p_local1, p_local2)
 
@@ -764,7 +784,7 @@ class EvoTracker(Tracker):
         # Define the searcher and logger
         searcher = self.optimizer(
             problem=self.problem,
-            stdev_init=self.stdev_init if self.optimizer is not CMAES else 1e-2,
+            stdev_init=self.stdev_init if self.optimizer is not CMAES else 1e-3,
             center_init=center_init,
             popsize=50,
         )

@@ -24,7 +24,7 @@ def parseArgs():
     data_dir = "data/consistency_evaluation/medium/0"
     parser.add_argument("--data_dir", type=str, default=data_dir)  # reference mask
     parser.add_argument(
-        "--ref_img_file", type=str, default=os.path.join(data_dir, "00010.jpg")
+        "--ref_img_file", type=str, default=os.path.join(data_dir, "00153.png")
     )  # reference mask
     parser.add_argument(
         "--joint_file", type=str, default=os.path.join(data_dir, "joint_0010.npy")
@@ -296,7 +296,7 @@ def main():
         print("loss=", best_loss, "cTr=", best_cTr)
 
         # 7) Black box / gradient-based optimization with the best cTr
-        use_bbox_optimizer = True
+        use_bbox_optimizer = False
 
         if use_bbox_optimizer:
             with th.no_grad():

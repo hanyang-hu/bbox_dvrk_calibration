@@ -9,13 +9,20 @@ pip install "git+https://github.com/facebookresearch/pytorch3d.git"
 pip install evotorch
 ```
 
-You also need to install NvDiffRast following the instructions [here](https://nvlabs.github.io/nvdiffrast/).
-
-For Linux, you may do
+You also need to install [NvDiffRast](https://nvlabs.github.io/nvdiffrast/) following the instructions below (for Linux):
 ```
 git clone https://github.com/NVlabs/nvdiffrast
 pip install .
 pip install ninja
+```
+
+To install [Deep Hough Transform](https://github.com/Hanqer/deep-hough-transform), run
+```
+cd deep-hough-transform
+cd model/_cdht
+python setup.py build 
+python setup.py install --user
+pip install pot
 ```
 
 # Calibration with differentiable rendering

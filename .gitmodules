@@ -1,0 +1,3 @@
+[submodule "deep-hough-transform"]
+	path = deep-hough-transform
+	url = git@github.com:hanyang-hu/deep-hough-transform.git

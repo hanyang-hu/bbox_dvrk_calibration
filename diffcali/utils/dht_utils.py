@@ -48,11 +48,14 @@ class DeepCylinderLoss:
             ]
         )
 
-        self.update_heatmap(mask)
+        if mask is not None:
+            self.update_heatmap(mask)
 
     def update_heatmap(self, mask):
+        self.img_size = mask.shape[2:]  # Get the original image size
         self.heatmap = self.model(self.transform(mask)).squeeze()
-        # self.heatmap = torch.exp(self.heatmap / 50.) 
+        # self.heatmap = torch.exp(-self.heatmap / 50.)
+        self.heatmap = torch.sigmoid(-self.heatmap / 10.) 
 
     def line2ends(self, lines):
         """
@@ -159,6 +162,13 @@ class DeepCylinderLoss:
         if mask_in_bounds.any():
             loss[mask_in_bounds] = self.heatmap[idx[mask_in_bounds, 0].long(), idx[mask_in_bounds, 1].long()]
 
+        # # Plot the heatmap and all evaluated poitns in bound
+        # import matplotlib.pyplot as plt
+        # plt.imshow(self.heatmap.squeeze().cpu().numpy(), cmap="jet")
+        # print(idx[:,1].cpu().numpy())
+        # plt.scatter(idx[:,1].cpu().numpy(), idx[:,0].cpu().numpy(), s=1, c='b')
+        # plt.show()
+
         # Split the loss back into two batches
         loss_1, loss_2 = loss[:B], loss[B:]
         
@@ -172,9 +182,17 @@ if __name__ == "__main__":
     model_dir = "./deep_hough_transform/dht_r50_nkl_d97b97138.pth"
     mask_dir = "./deep_hough_transform/data/DVRK/7.jpg"
     
+    # img = cv2.imread(mask_dir, cv2.IMREAD_GRAYSCALE)
+    # mask = transforms.ToTensor()(img).cuda() 
+    # mask = mask.repeat(3, 1, 1).unsqueeze(0)
+    # img = mask.squeeze().permute(1, 2, 0).cpu().numpy() * 255
+
     img = cv2.imread(mask_dir, cv2.IMREAD_COLOR)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
-    mask = transforms.ToTensor()(img).unsqueeze(0).cuda() 
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    mask = transforms.ToTensor()(img).cuda()
+    mask = mask.unsqueeze(0)  # Add batch dimension
+
+    # print(torch.abs(mask - mask2).sum().item())
 
     with torch.no_grad():
         DHT_loss = DeepCylinderLoss(model_dir=model_dir, mask=mask, img_size=mask.shape[2:])

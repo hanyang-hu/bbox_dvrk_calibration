@@ -15,6 +15,7 @@ from diffcali.utils.cylinder_projection_utils import (
     transform_points_b,
 )
 from diffcali.utils.detection_utils import detect_lines
+from diffcali.utils.dht_utils import DeepCylinderLoss
 
 from evotorch import Problem, SolutionBatch
 from evotorch.algorithms import SNES, XNES, CMAES
@@ -25,12 +26,13 @@ torch.set_default_dtype(torch.float32)
 
 
 # Loss settings
+USE_PTS_LOSS = True  # whether to use keypoint loss
+USE_CYD_LOSS = True # whether to use cylinder loss
+USE_DHT_LOSS = True and not USE_CYD_LOSS # whether to use DHT loss (if cylinder loss is not used)
+
 MSE_WEIGHT = 10.0  # weight for the MSE loss
 PTS_WEIGHT = 1e-2  # weight for the keypoint loss
-CYD_WEIGHT = 1e-2  # weight for the cylinder loss
-
-USE_PTS_LOSS = True  # whether to use keypoint loss
-USE_CYD_LOSS = False  # whether to use cylinder loss
+CYD_WEIGHT = 1e-1 if USE_DHT_LOSS else 1e-2 # weight for the cylinder loss
 
 
 def keypoint_loss_batch(keypoints_a, keypoints_b):
@@ -480,6 +482,7 @@ class PoseEstimationProblem(Problem):
 
         self.kpts_loss = USE_PTS_LOSS
         self.cylinder_loss = USE_CYD_LOSS
+        self.dht_loss = USE_DHT_LOSS
 
         self.mse_weight = MSE_WEIGHT  # weight for the MSE loss
         self.pts_weight = PTS_WEIGHT  # weight for the keypoint loss
@@ -612,6 +615,7 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
         super().__init__(model, robot_renderer, ref_mask, intr, p_local1, p_local2)
 
         self.joint_angles = joint_angles
+        self.DHT_loss = DeepCylinderLoss(img_size=(480, 640)) if self.dht_loss else None
 
     def update_problem(self, ref_mask, ref_keypoints, det_line_params, joint_angles):
         """
@@ -621,6 +625,11 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
         self.ref_keypoints = ref_keypoints
         self.det_line_params = det_line_params
         self.joint_angles = joint_angles
+
+        # Update the DHT loss with the reference mask
+        if self.dht_loss:
+            mask = ref_mask.repeat(3, 1, 1).unsqueeze(0)
+            self.DHT_loss.update_heatmap(mask)
 
         # Compute the robot mesh once and store it since the joint angles are fixed.
         self.verts, self.faces = self.robot_renderer.get_robot_verts_and_faces(joint_angles)
@@ -692,6 +701,31 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
                 radius,
             )  
 
+        elif self.dht_loss:
+            position = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
+            direction = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
+            direction[:, 2] = 1.0
+            pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch).squeeze(0)  # shape(B, 4, 4)
+            radius = 0.0085 / 2
+
+            # get the projected cylinder lines parameters
+            ref_mask = self.ref_mask
+            intr = self.intr
+
+            _, cam_pts_3d_position = transform_points_b(position, pose_matrix_b, intr)
+            _, cam_pts_3d_norm = transform_points_b(direction, pose_matrix_b, intr)
+            cam_pts_3d_norm = torch.nn.functional.normalize(
+                cam_pts_3d_norm
+            )  # NORMALIZE !!!!!!
+
+            # print(f"checking shape of cylinder input: {cam_pts_3d_position.shape, cam_pts_3d_norm.shape}")  both [B,3]
+            e_1, e_2 = projectCylinderTorch(
+                cam_pts_3d_position, cam_pts_3d_norm, radius, self.fx, self.fy, self.px, self.py
+            )  # [B,2], [B,2]
+            projected_lines = torch.stack((e_1, e_2), dim=1)  # [B, 2, 2]
+            
+            cylinder_val = self.DHT_loss(projected_lines) # maximize in the heatmap
+
         else:
             cylinder_val = 0.0
 
@@ -704,7 +738,7 @@ class EvoTracker(Tracker):
     def __init__(
         self, model, robot_renderer, init_cTr, init_joint_angles, 
         num_iters=5, intr=None, p_local1=None, p_local2=None, 
-        stdev_init=5e-3, use_SNES=False, optimize_joint_angles=True
+        stdev_init=5e-3, use_SNES=False, optimize_joint_angles=False
     ):
         super().__init__(model, robot_renderer, init_cTr, init_joint_angles, num_iters, intr, p_local1, p_local2)
 

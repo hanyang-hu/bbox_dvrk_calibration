@@ -16,9 +16,10 @@ pip install .
 pip install ninja
 ```
 
-To install [Deep Hough Transform](https://github.com/Hanqer/deep-hough-transform), run
+To install [Deep Hough Transform](https://github.com/Hanqer/deep-hough-transform) and download the pretrained weights, run
 ```
 cd deep_hough_transform
+wget http://data.kaizhao.net/projects/deep-hough-transform/dht_r50_nkl_d97b97138.pth
 cd model/_cdht
 python setup.py build 
 python setup.py install --user

@@ -1,8 +1,8 @@
 # Conda environment setup
 
 ```
-conda create --name diffcali python=3.10
-conda activate diffcali
+conda create --name bboxcali python=3.10
+conda activate bboxcali
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 pip install "git+https://github.com/facebookresearch/pytorch3d.git"
@@ -18,15 +18,13 @@ pip install ninja
 
 To install [Deep Hough Transform](https://github.com/Hanqer/deep-hough-transform), run
 ```
-cd deep-hough-transform
+cd deep_hough_transform
 cd model/_cdht
 python setup.py build 
 python setup.py install --user
-pip install pot
 ```
 
-# Calibration with differentiable rendering
-
+# Calibration with NvDiffRast + XNES (instead of differentiable rendering)
 
 Run:
 ```

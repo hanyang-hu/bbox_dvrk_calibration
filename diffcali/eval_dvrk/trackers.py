@@ -15,7 +15,7 @@ from diffcali.utils.cylinder_projection_utils import (
     transform_points_b,
 )
 from diffcali.utils.detection_utils import detect_lines
-from diffcali.utils.dht_utils import DeepCylinderLoss
+from diffcali.utils.dht_utils import DeepCylinderLoss, SmoothDeepCylinderLoss
 
 from evotorch import Problem, SolutionBatch
 from evotorch.algorithms import SNES, XNES, CMAES
@@ -26,9 +26,10 @@ torch.set_default_dtype(torch.float32)
 
 
 # Loss settings
-USE_PTS_LOSS = True  # whether to use keypoint loss
-USE_CYD_LOSS = True # whether to use cylinder loss
-USE_DHT_LOSS = True and not USE_CYD_LOSS # whether to use DHT loss (if cylinder loss is not used)
+USE_RENDER_LOSS = True
+USE_PTS_LOSS = False  # whether to use keypoint loss
+USE_CYD_LOSS = False # whether to use cylinder loss
+USE_DHT_LOSS = False and not USE_CYD_LOSS # whether to use DHT loss (if cylinder loss is not used)
 
 MSE_WEIGHT = 10.0  # weight for the MSE loss
 PTS_WEIGHT = 1e-2  # weight for the keypoint loss
@@ -216,6 +217,7 @@ class GradientTracker(Tracker):
             print("[Enabling antialiasing for better gradients.]")
             self.model.use_antialiasing = True # use antialiasing for better gradients
 
+        self.render_loss = USE_RENDER_LOSS
         self.kpts_loss = USE_PTS_LOSS
         self.cylinder_loss = USE_CYD_LOSS
 
@@ -357,13 +359,17 @@ class GradientTracker(Tracker):
         for _ in range(self.num_iters):
             optimizer.zero_grad()
 
-            self.robot_mesh = self.robot_renderer.get_robot_mesh(joint_angles) 
-
             cTr = th.cat((axis, xyz), dim=0)  # concatenate axis and xyz to form cTr
 
-            rendered_mask = self.model.render_single_robot_mask(cTr, self.robot_mesh, self.robot_renderer).squeeze(0) 
+            if self.render_loss:
+                self.robot_mesh = self.robot_renderer.get_robot_mesh(joint_angles) 
 
-            mse = F.mse_loss(rendered_mask, mask)
+                rendered_mask = self.model.render_single_robot_mask(cTr, self.robot_mesh, self.robot_renderer).squeeze(0) 
+
+                mse = F.mse_loss(rendered_mask, mask)
+            
+            else:
+                mse = 0.0
 
             # cylinder loss
             if self.cylinder_loss:
@@ -480,6 +486,7 @@ class PoseEstimationProblem(Problem):
         self.ref_keypoints = None
         self.det_line_params = None
 
+        self.render_loss = USE_RENDER_LOSS
         self.kpts_loss = USE_PTS_LOSS
         self.cylinder_loss = USE_CYD_LOSS
         self.dht_loss = USE_DHT_LOSS
@@ -535,21 +542,26 @@ class PoseEstimationProblem(Problem):
         cTr_batch = values[:, :6]  # shape (B, 6)
         joint_angles = values[:, 6:]  # shape (B, 4)
         B = cTr_batch.shape[0]
-        self.ref_mask_b = self.ref_mask.unsqueeze(0).expand(
-            B, self.ref_mask.shape[0], self.ref_mask.shape[1]
-        )
 
-        verts, faces = self.robot_renderer.batch_get_robot_verts_and_faces(joint_angles)
+        if self.render_loss:
+            self.ref_mask_b = self.ref_mask.unsqueeze(0).expand(
+                B, self.ref_mask.shape[0], self.ref_mask.shape[1]
+            )
 
-        pred_masks_b = self.model.render_robot_mask_batch_nvdiffrast(
-            cTr_batch, verts, faces, self.robot_renderer
-        )  # shape (B,H,W)
+            verts, faces = self.robot_renderer.batch_get_robot_verts_and_faces(joint_angles)
+            pred_masks_b = self.model.render_robot_mask_batch_nvdiffrast(
+                cTr_batch, verts, faces, self.robot_renderer
+            )  # shape (B,H,W)
 
-        mse = F.mse_loss(
-            pred_masks_b,
-            self.ref_mask_b,
-            reduction="none",
-        ).mean(dim=(1, 2))
+            mse = F.mse_loss(
+                pred_masks_b,
+                self.ref_mask_b,
+                reduction="none",
+            ).mean(dim=(1, 2))
+
+        else:
+            print(mse)
+            mse = 0.0
 
         if self.kpts_loss:
             pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch)  # [B, 4, 4]
@@ -615,7 +627,7 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
         super().__init__(model, robot_renderer, ref_mask, intr, p_local1, p_local2)
 
         self.joint_angles = joint_angles
-        self.DHT_loss = DeepCylinderLoss(img_size=(480, 640)) if self.dht_loss else None
+        self.DHT_loss = SmoothDeepCylinderLoss(img_size=(480, 640)) if self.dht_loss else None
 
     def update_problem(self, ref_mask, ref_keypoints, det_line_params, joint_angles):
         """
@@ -643,19 +655,23 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
         values = solutions.values.clone()
         cTr_batch = values[:, :6]  # shape (B, 6)
         B = cTr_batch.shape[0]
-        self.ref_mask_b = self.ref_mask.unsqueeze(0).expand(
-            B, self.ref_mask.shape[0], self.ref_mask.shape[1]
-        )
 
-        pred_masks_b = self.model.render_robot_mask_batch_nvdiffrast(
-            cTr_batch, self.verts, self.faces, self.robot_renderer
-        )  # shape (B,H,W)
+        if self.render_loss:
+            self.ref_mask_b = self.ref_mask.unsqueeze(0).expand(
+                B, self.ref_mask.shape[0], self.ref_mask.shape[1]
+            )
+            pred_masks_b = self.model.render_robot_mask_batch_nvdiffrast(
+                cTr_batch, self.verts, self.faces, self.robot_renderer
+            )  # shape (B,H,W)
 
-        mse = F.mse_loss(
-            pred_masks_b,
-            self.ref_mask_b,
-            reduction="none",
-        ).mean(dim=(1, 2))
+            mse = F.mse_loss(
+                pred_masks_b,
+                self.ref_mask_b,
+                reduction="none",
+            ).mean(dim=(1, 2))
+
+        else:
+            mse = 0.0
 
         if self.kpts_loss:
             pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch)  # [B, 4, 4]

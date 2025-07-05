@@ -26,9 +26,9 @@ torch.set_default_dtype(torch.float32)
 
 
 # Loss settings
-USE_RENDER_LOSS = True
-USE_PTS_LOSS = False  # whether to use keypoint loss
-USE_CYD_LOSS = False # whether to use cylinder loss
+USE_RENDER_LOSS = False
+USE_PTS_LOSS = True  # whether to use keypoint loss
+USE_CYD_LOSS = True # whether to use cylinder loss
 USE_DHT_LOSS = False and not USE_CYD_LOSS # whether to use DHT loss (if cylinder loss is not used)
 
 MSE_WEIGHT = 10.0  # weight for the MSE loss
@@ -446,7 +446,8 @@ class DummyLogger(Logger):
         searcher, 
         *, 
         interval: int = 1, 
-        after_first_step: bool = False, ):
+        after_first_step: bool = False
+    ):
         # Call the super constructor
         super().__init__(searcher, interval=interval, after_first_step=after_first_step)
 
@@ -457,6 +458,8 @@ class DummyLogger(Logger):
         if status["pop_best_eval"] < self.best_eval:
             self.best_solution = status["pop_best"].values.clone()
             self.best_eval = status["pop_best_eval"]
+
+        self._steps_count += 1
 
 
 class PoseEstimationProblem(Problem):
@@ -497,6 +500,9 @@ class PoseEstimationProblem(Problem):
     
     # def _fill(self, values: torch.Tensor):
     #     raise NotImplementedError("Must initialize the problem with a solution.")
+
+    def fine_search(self):
+        self.render_loss = True
 
     def update_problem(
         self, ref_mask, ref_keypoints, det_line_params, joint_angles
@@ -560,7 +566,6 @@ class PoseEstimationProblem(Problem):
             ).mean(dim=(1, 2))
 
         else:
-            print(mse)
             mse = 0.0
 
         if self.kpts_loss:
@@ -754,7 +759,7 @@ class EvoTracker(Tracker):
     def __init__(
         self, model, robot_renderer, init_cTr, init_joint_angles, 
         num_iters=5, intr=None, p_local1=None, p_local2=None, 
-        stdev_init=5e-3, use_SNES=False, optimize_joint_angles=False
+        stdev_init=5e-3, use_SNES=False, optimize_joint_angles=True
     ):
         super().__init__(model, robot_renderer, init_cTr, init_joint_angles, num_iters, intr, p_local1, p_local2)
 
@@ -841,7 +846,11 @@ class EvoTracker(Tracker):
         logger = DummyLogger(searcher, interval=1, after_first_step=True)
 
         # Run the optimization
-        searcher.run(self.num_iters)
+        num_coarse_steps = int(self.num_iters * 0.7)
+        num_fine_steps = self.num_iters - num_coarse_steps
+        searcher.run(num_coarse_steps)
+        searcher.problem.fine_search()  # Switch to fine search mode
+        searcher.run(num_fine_steps)
 
         # Extract the best solution and evaluation from the logger
         best_solution = logger.best_solution

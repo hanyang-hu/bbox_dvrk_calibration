@@ -2,7 +2,7 @@ numpy
 matplotlib
 tqdm
 opencv-python
-kornia
+kornia==0.6.0
 scikit-fmm
 scipy
 scikit-image

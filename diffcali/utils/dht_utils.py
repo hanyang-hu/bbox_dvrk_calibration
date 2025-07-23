@@ -58,6 +58,7 @@ class DeepCylinderLoss:
 
         self.img_size = mask.shape[2:]  # Get the original image size
         self.heatmap = self.model(self.transform(mask)).squeeze()
+        self.heatmap = self.heatmap.sigmoid()
         
         # # Manipulate the loss surface
         # binary_mask = torch.sigmoid(self.heatmap) > 1e-9 # thresholding
@@ -167,22 +168,42 @@ class DeepCylinderLoss:
         hough_coords = self.line2hough(lines)
         idx = self.hough2idx(hough_coords)
 
-        # Compute the loss based on the heatmap
-        loss = torch.full(fill_value=-float('inf'), size=(2*B,), dtype=torch.float32, device=lines.device)
-        mask_in_bounds = (idx[:, 0] >= 0) & (idx[:, 0] < self.numAngle) & (idx[:, 1] >= 0) & (idx[:, 1] < self.numRho)
-        if mask_in_bounds.any():
-            loss[mask_in_bounds] = self.heatmap[idx[mask_in_bounds, 0].long(), idx[mask_in_bounds, 1].long()]
+        # # Compute the loss based on the heatmap
+        # loss = torch.full(fill_value=-float('inf'), size=(2*B,), dtype=torch.float32, device=lines.device)
+        # mask_in_bounds = (idx[:, 0] >= 0) & (idx[:, 0] < self.numAngle) & (idx[:, 1] >= 0) & (idx[:, 1] < self.numRho)
+        # if mask_in_bounds.any():
+        #     loss[mask_in_bounds] = self.heatmap[idx[mask_in_bounds, 0].long(), idx[mask_in_bounds, 1].long()]
+
+        # Create one-hot maps [B, 1, numAngle, numRho]
+        one_hot = torch.zeros((2 * B, 1, self.numAngle, self.numRho)).cuda()
+        y = idx[:, 0].long()
+        x = idx[:, 1].long()
+        one_hot[torch.arange(2 * B), 0, y, x] = 1.0
+        one_hot = one_hot[:B] + one_hot[B:]  # Combine the two batches
+
+        # Apply Gaussian blur
+        blurred = transforms.functional.gaussian_blur(one_hot, kernel_size=5, sigma=1) # [2*B, numAngle, numRho]
+        
+        # # Visualize the blurred heatmap
+        # import matplotlib.pyplot as plt
+        # plt.imshow(blurred[0].squeeze().cpu().numpy(), cmap='jet')
+        # plt.show()
+
+        # Compute cross entropy loss
+        cross_entropy = torch.nn.functional.binary_cross_entropy(
+            input=self.heatmap.expand(B, -1, -1),
+            target=blurred.squeeze(1),
+            reduction='none'
+        )
+        loss = cross_entropy.view(B, -1).sum(dim=1)  # Sum over the spatial dimensions
 
         # # Plot the heatmap and all evaluated poitns in bound
         # import matplotlib.pyplot as plt
         # plt.imshow(-self.heatmap.squeeze().cpu().numpy(), cmap="jet")
-        # plt.scatter(idx[:,1].cpu().numpy(), idx[:,0].cpu().numpy(), s=1, c='b')
+        # plt.scatter(idx[:,1].cpu().numpy(), idx[:,0].cpu().numpy(), s=1, c='white')
         # plt.show()
-
-        # Split the loss back into two batches
-        loss_1, loss_2 = loss[:B], loss[B:]
         
-        return loss_1 + loss_2
+        return loss
 
 
 class SmoothDeepCylinderLoss(DeepCylinderLoss):
@@ -191,7 +212,7 @@ class SmoothDeepCylinderLoss(DeepCylinderLoss):
     """
     def __init__(
         self, model_dir="./deep_hough_transform/dht_r50_nkl_d97b97138.pth", mask=None, numAngle=100, numRho=100, 
-        img_size=(480, 640), input_size=(400, 400), sigma=None, beta=1e-3):
+        img_size=(480, 640), input_size=(400, 400), sigma=None, beta=1e-2):
         super().__init__(model_dir=model_dir, mask=mask, numAngle=numAngle, numRho=numRho, img_size=img_size, input_size=input_size)
 
         if sigma is None:
@@ -319,17 +340,20 @@ def main1():
     from scipy.optimize import minimize
     def objective_function(params):
         a, b = params
-        # Convert (a, b) to Hough coordinates
-        hough_coords = DHT_loss.line2hough(torch.tensor([[a, b]]).cuda())
-        idx = DHT_loss.hough2idx(hough_coords)
-        if idx[0, 0] < 0 or idx[0, 0] >= DHT_loss.numAngle or idx[0, 1] < 0 or idx[0, 1] >= DHT_loss.numRho:
-            return float('inf')
-        return -DHT_loss.heatmap[idx[0, 0].long(), idx[0, 1].long()].item()  # Negative for maximization
+        # # Convert (a, b) to Hough coordinates
+        # hough_coords = DHT_loss.line2hough(torch.tensor([[a, b]]).cuda())
+        # idx = DHT_loss.hough2idx(hough_coords)
+        # if idx[0, 0] < 0 or idx[0, 0] >= DHT_loss.numAngle or idx[0, 1] < 0 or idx[0, 1] >= DHT_loss.numRho:
+        #     return float('inf')
+        # return -DHT_loss.heatmap[idx[0, 0].long(), idx[0, 1].long()].item()  # Negative for maximization
+        lines_tensor = torch.tensor([[a, b], [a, b]]).cuda().unsqueeze(0)  # Create a batch of lines
+        loss = DHT_loss(lines_tensor)
+        return loss.item()  # Return the loss value for minimization
 
     # Correct coordinates: [(303, 0, 251, 399), (227, 0, 237, 399)]
     a = 0.00053764774973738
     b = 0.0055005500550055
-    initial_guess = [0.0005, 0.005]  # Initial guess for (a, b)
+    initial_guess = [0.0006, 0.005]  # Initial guess for (a, b)
     result = minimize(objective_function, initial_guess, method='Nelder-Mead', options={'maxiter': 1000, 'disp': True})
     a_opt, b_opt = result.x
     print(f"Optimized line parameters: a = {a_opt}, b = {b_opt}")
@@ -351,7 +375,7 @@ def main1():
 
     # Plot the original image and the heatmap
     heatmap = DHT_loss.heatmap.squeeze().cpu().numpy()
-    binary_kmap = DHT_loss.heatmap.sigmoid().squeeze().cpu().numpy() > 1e-4
+    binary_kmap = DHT_loss.heatmap.squeeze().cpu().numpy() > 1e-4
     kmap_label = label(binary_kmap, connectivity=1)
     props = regionprops(kmap_label)
     # print(vars(props[0]))
@@ -371,7 +395,7 @@ def main1():
     plt.subplot(1, 2, 2)
     plt.imshow(heatmap, cmap='jet')
     # draw the line on the heatmap
-    plt.plot(idx[0, 1].item(), idx[0, 0].item(), 'bo', markersize=5)  # Mark the max point
+    plt.plot(idx[0, 1].item(), idx[0, 0].item(), 'ro', markersize=7)  # Mark the max point
     plt.plot(p1[1], p1[0], 'ro', markersize=3)  # Mark the first centroid
     plt.plot(p2[1], p2[0], 'ro', markersize=3)  # Mark the second centroid
     plt.title("Heatmap")
@@ -437,5 +461,5 @@ if __name__ == "__main__":
     from matplotlib import pyplot as plt
 
     # Example usage
-    # main1()
-    main2()
+    main1()
+    # main2()

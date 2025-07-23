@@ -3,6 +3,10 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from diffcali.models.CtRNet import CtRNet
+from diffcali.utils.euler_angle_utils import (
+    euler_angle_to_axis_angle,
+    axis_angle_to_euler_angle
+)
 
 import math
 import torch
@@ -14,6 +18,7 @@ import cv2
 import argparse
 import time
 import warnings
+
 
 def parseArgs():
     parser = argparse.ArgumentParser()
@@ -183,6 +188,20 @@ if __name__ == "__main__":
         B = cTr_batch.shape[0] 
         print(f"All ctr candiates: {cTr_batch.shape}")
 
+        angle_axis_batch = cTr_batch[:, :3]  # Extract axis-angle part
+        euler_angle_batch = axis_angle_to_euler_angle(angle_axis_batch)  # Convert to Euler angles
+        axis_angle_converted = euler_angle_to_axis_angle(euler_angle_batch)
+
+        # Test the conversion accuracy
+        R = kornia.geometry.conversions.axis_angle_to_rotation_matrix(angle_axis_batch)
+        R_converted = kornia.geometry.conversions.axis_angle_to_rotation_matrix(axis_angle_converted)
+
+        # Check if the conversion is consistent
+        rot_diff = torch.norm(R - R_converted, dim=(1, 2))
+        print("Rotation matrix difference:", rot_diff)
+        assert torch.allclose(R, R_converted, atol=1e-5)
+        print("Axis-angle conversion is consistent.")
+
         # a.4) Render silhouette shaders
         # warm-up for more accurate timing
         pred_masks = model.render_robot_mask_batch(
@@ -203,6 +222,10 @@ if __name__ == "__main__":
         resolution = (args.height, args.width)
 
         # b.2) Prepare data for rendering (using utils in PyTorch3D)
+        # euler_angle_batch[:,2] += torch.pi / 3 # local roll
+        # axis_angle_converted = euler_angle_to_axis_angle(euler_angle_batch)  # Convert back to axis-angle
+        cTr_batch[:, :3] = axis_angle_converted  # Update the axis-angle part with converted values
+
         R_batched = kornia.geometry.conversions.angle_axis_to_rotation_matrix(
             cTr_batch[:, :3]
         ) 

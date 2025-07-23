@@ -1,6 +1,7 @@
 import torch
 import torch as th
 import torch.nn.functional as F
+import FastGeodis
 import numpy as np
 import math
 import cv2
@@ -16,24 +17,72 @@ from diffcali.utils.cylinder_projection_utils import (
 )
 from diffcali.utils.detection_utils import detect_lines
 from diffcali.utils.dht_utils import DeepCylinderLoss, SmoothDeepCylinderLoss
+from diffcali.utils.angle_transform_utils import (
+    mix_angle_to_axis_angle,
+    axis_angle_to_mix_angle
+)
+from diffcali.utils.cma_es import CMAES_cus
 
 from evotorch import Problem, SolutionBatch
 from evotorch.algorithms import SNES, XNES, CMAES
-from evotorch.logging import Logger
+from evotorch.logging import Logger, StdOutLogger
 
 
 torch.set_default_dtype(torch.float32)
 
 
 # Loss settings
-USE_RENDER_LOSS = False
+USE_RENDER_LOSS = True
 USE_PTS_LOSS = True  # whether to use keypoint loss
-USE_CYD_LOSS = True # whether to use cylinder loss
+USE_CYD_LOSS = False # whether to use cylinder loss
 USE_DHT_LOSS = False and not USE_CYD_LOSS # whether to use DHT loss (if cylinder loss is not used)
 
-MSE_WEIGHT = 10.0  # weight for the MSE loss
-PTS_WEIGHT = 1e-2  # weight for the keypoint loss
-CYD_WEIGHT = 1e-1 if USE_DHT_LOSS else 1e-2 # weight for the cylinder loss
+MSE_WEIGHT = 6.  # weight for the MSE loss
+DIST_WEIGHT = 12e-7 # weight for the distance loss (based on Euclidean distance transform)
+APP_WEIGHT = 6e-6 # 
+PTS_WEIGHT = 5e-3  # weight for the keypoint loss
+CYD_WEIGHT = 1e-2 if USE_DHT_LOSS else 1e-2 # weight for the cylinder loss
+
+
+# Objective Setting
+USE_MIX_ANGLE = True
+USE_WEIGHTING_MASK = False
+
+
+def convert_line_params_to_endpoints(a, b, image_width, image_height):
+    """
+    Convert line parameters (a, b) in the form au + bv = 1 to endpoints (x1, y1), (x2, y2).
+
+    Args:
+        a (float): Parameter 'a' from the line equation.
+        b (float): Parameter 'b' from the line equation.
+        image_width (int): Width of the image.
+        image_height (int): Height of the image.
+
+    Returns:
+        tuple: Endpoints (x1, y1), (x2, y2) for drawing the line.
+    """
+    if a < 0:
+        # Normalize to ensure a is positive
+        a = -a
+        b = -b
+
+    # Calculate endpoints by choosing boundary values for 'u'
+    if b != 0:
+        # Set u = 0 to find y-intercept
+        x1 = 0
+        y1 = int((1 - a * x1) / b)
+
+        # Set u = image_width to find corresponding 'v'
+        x2 = image_width
+        y2 = int((1 - a * x2) / b)
+    else:
+        # Vertical line: set v based on boundaries
+        y1 = 0
+        y2 = image_height
+        x1 = x2 = int(1 / a)
+
+    return (x1, y1), (x2, y2)
 
 
 def keypoint_loss_batch(keypoints_a, keypoints_b):
@@ -186,20 +235,87 @@ class Tracker:
         """
         raise NotImplementedError("Tracking method not implemented.")
 
-    def overlay_mask(self, ref_mask, pred_mask):
+    def overlay_mask(self, ref_mask, pred_mask, ref_pts=None, proj_pts=None, ref_lines=None, proj_lines=None):
         """
         Overlay the predicted mask on the reference mask for visualization.
         """
         # Convert masks to grayscale images
-        ref_mask = ref_mask.cpu().numpy()
-        pred_mask = pred_mask.cpu().numpy()
-        ref_mask = (ref_mask * 255).astype(np.uint8)
-        pred_mask = (pred_mask * 255).astype(np.uint8)
+        ref_mask = ref_mask.float().cpu().numpy()
+        pred_mask = pred_mask.float().cpu().numpy()
+        # ref_mask = (ref_mask*255).astype(np.uint8)
+        # pred_mask = (pred_mask*255).astype(np.uint8)
+
+        w, h = ref_mask.shape[1], ref_mask.shape[0]
         
         # Create a color overlay
-        overlay = np.zeros((ref_mask.shape[0], ref_mask.shape[1], 3), dtype=np.uint8)
-        overlay[..., 0] = ref_mask
-        overlay[..., 1] = pred_mask
+        # rendered_color = np.stack([0.5 * pred_mask, 0.8 * pred_mask, np.zeros_like(pred_mask)], axis=-1) # Light blue for rendered mask
+        # ref_color = np.stack([ref_mask, 0.6 * ref_mask, 0.1 * ref_mask], axis=-1)  # Orange for reference mask
+        # overlay = rendered_color * 0.5 + ref_color * 0.5
+        # # overlay = np.clip(overlay, 0, 1)
+        # overlay = (overlay * 255).astype(np.uint8)
+        # overlay = np.clip(overlay, 0, 255)
+        overlay = np.zeros((h, w, 3), dtype=np.uint8)  # Create an empty overlay image
+        overlay[..., 0] = (ref_mask * 255).astype(np.uint8)  # Blue channel 
+        overlay[..., 2] = (pred_mask * 255).astype(np.uint8)  # Green channel
+
+        if ref_pts != None:
+            center_ref_pt = th.mean(ref_pts, dim=0)
+            for ref_pt in ref_pts:
+                u_ref, v_ref = int(ref_pt[0]), int(ref_pt[1])
+                cv2.circle(
+                    overlay,
+                    (u_ref, v_ref),
+                    radius=5,
+                    color=(255, 0.6 * 255, 0.1 * 255),
+                    thickness=-1,
+                )  # Green
+
+            u_ref, v_ref = int(center_ref_pt[0]), int(center_ref_pt[1])
+            cv2.circle(
+                overlay,
+                (u_ref, v_ref),
+                radius=5,
+                color=(255, 0.6 * 255, 0.1 * 255),
+                thickness=-1,
+            )  # Green  BGR
+            # Draw projected keypoints in red
+
+        if proj_pts is not None:
+            center_proj_pt = th.mean(proj_pts, dim=0)
+            for proj_pt in proj_pts.squeeze():
+                # print(f"debugging the project pts {proj_pts}")
+                u_proj, v_proj = int(proj_pt[0].item()), int(proj_pt[1].item())
+                cv2.circle(
+                    overlay, (u_proj, v_proj), radius=5, color=(255*0.1, 255*0.6, 255), thickness=-1
+                )  # Red
+
+            u_ref, v_ref = int(center_proj_pt[0]), int(center_proj_pt[1])
+            cv2.circle(
+                overlay, (u_ref, v_ref), radius=5, color=(255*0.1, 255*0.6, 255), thickness=-1
+            )  # Green
+
+        # Draw detected lines in blue (convert from line parameters to endpoints)
+        if ref_lines is not None:
+            for line_params in ref_lines:
+                a, b = line_params
+                (x1, y1), (x2, y2) = convert_line_params_to_endpoints(a.item(), b.item(), w, h)
+                cv2.line(
+                    overlay,
+                    (x1, y1),
+                    (x2, y2),
+                    (255, 0.6 * 255, 0.1 * 255),
+                    thickness=2,
+                ) 
+
+        # Draw projected lines in cyan (convert from line parameters to endpoints)
+        if proj_lines is not None:
+            for line_params in proj_lines:
+                a, b = line_params
+                (x1, y1), (x2, y2) = convert_line_params_to_endpoints(a, b, w, h)
+                cv2.line(
+                    overlay, (x1, y1), (x2, y2), (255*0.1, 255*0.6, 255), thickness=2
+                ) 
+
 
         return overlay
 
@@ -337,7 +453,7 @@ class GradientTracker(Tracker):
 
         axis.requires_grad = True
         xyz.requires_grad = True
-        joint_angles.requires_grad = True
+        # joint_angles.requires_grad = True
 
         optimizer = torch.optim.Adam(
             [
@@ -349,10 +465,10 @@ class GradientTracker(Tracker):
                     "params": xyz,
                     "lr": self.lr,
                 },
-                {
-                    "params": joint_angles,
-                    "lr": self.lr,
-                },
+                # {
+                #     "params": joint_angles,
+                #     "lr": self.lr,
+                # },
             ]
         )   
 
@@ -431,7 +547,60 @@ class GradientTracker(Tracker):
         self._prev_joint_angles = joint_angles.detach()
 
         if visualization:
-            overlay = self.overlay_mask(mask.detach(), rendered_mask.detach())
+            # Render the predicted mask for visualization
+            robot_mesh = self.robot_renderer.get_robot_mesh(joint_angles)
+            rendered_mask = self.model.render_single_robot_mask(cTr, robot_mesh, self.robot_renderer).squeeze(0)
+
+            # Project keypoints
+            pose_matrix = self.model.cTr_to_pose_matrix(cTr.unsqueeze(0)).squeeze()
+            R_list, t_list = lndFK(joint_angles)
+            R_list = R_list.to(self.model.device)
+            t_list = t_list.to(self.model.device)
+            p_img1 = get_img_coords(
+                self.p_local1,
+                R_list[2],
+                t_list[2],
+                pose_matrix.to(joint_angles.dtype),
+                self.intr,
+            )
+            p_img2 = get_img_coords(
+                self.p_local2,
+                R_list[3],
+                t_list[3],
+                pose_matrix.to(joint_angles.dtype),
+                self.intr,
+            )
+            proj_keypoints = th.stack([p_img1, p_img2], dim=0)
+
+            # Project cylinders
+            cTr_batch = cTr.unsqueeze(0)  # shape (1, 6)
+            B = 1
+            position = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
+            direction = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
+            direction[:, 2] = 1.0
+            pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch).squeeze(0)  # shape(B, 4, 4)
+            radius = 0.0085 / 2
+            intr = self.intr
+            fx, fy, px, py = intr[0, 0].item(), intr[1, 1].item(), intr[0, 2].item(), intr[1, 2].item()
+
+            _, cam_pts_3d_position = transform_points(position, pose_matrix, intr)
+            _, cam_pts_3d_norm = transform_points(direction, pose_matrix, intr)
+            cam_pts_3d_norm = th.nn.functional.normalize(cam_pts_3d_norm)
+            e_1, e_2 = projectCylinderTorch(
+                cam_pts_3d_position, cam_pts_3d_norm, radius, fx, fy, px, py
+            )  # [B,2], [B,2]
+            projected_lines = torch.stack((e_1, e_2), dim=1)  # [B, 2, 2]
+
+            # Plot the overlay mask
+            overlay = self.overlay_mask(
+                mask.detach(), 
+                rendered_mask.detach(),
+                ref_pts=ref_keypoints,
+                proj_pts=proj_keypoints,
+                ref_lines=self.det_line_params.squeeze(),
+                proj_lines=projected_lines.squeeze()
+            )
+
             return cTr.detach(), joint_angles.detach(), loss.item(), overlay
         else:
             return cTr.detach(), joint_angles.detach(), loss.item(), None
@@ -458,21 +627,25 @@ class DummyLogger(Logger):
         if status["pop_best_eval"] < self.best_eval:
             self.best_solution = status["pop_best"].values.clone()
             self.best_eval = status["pop_best_eval"]
+            # print(f"New best solution found: {self.best_solution}, evaluation: {self.best_eval}")
+
+        # self.best_solution = status["pop_best"].values.clone()
+        # self.best_eval = status["pop_best_eval"]
 
         self._steps_count += 1
 
 
 class PoseEstimationProblem(Problem):
     def __init__(
-        self, model, robot_renderer, ref_mask, intr, p_local1, p_local2
+        self, model, robot_renderer, ref_mask, intr, p_local1, p_local2, stdev_init
     ):
         super().__init__(
             objective_sense="min",
             solution_length=10, 
             device=model.device,
             initial_bounds=(
-                th.tensor([-math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi], device=model.device),
-                th.tensor([math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi], device=model.device),
+                [-math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi],
+                [math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi],
             )
         )
 
@@ -495,22 +668,89 @@ class PoseEstimationProblem(Problem):
         self.dht_loss = USE_DHT_LOSS
 
         self.mse_weight = MSE_WEIGHT  # weight for the MSE loss
+        self.dist_weight = DIST_WEIGHT  # weight for the distance loss
+        self.app_weight = APP_WEIGHT  # weight for the appearance loss
         self.pts_weight = PTS_WEIGHT  # weight for the keypoint loss
         self.cylinder_weight = CYD_WEIGHT  # weight for the cylinder loss
+
+        self.use_mix_angle = USE_MIX_ANGLE
+
+        # Convert stdev_init to lengthscales
+        if torch.is_tensor(stdev_init):
+            self.lengthscales = stdev_init.clone().detach()
+        else:
+            self.lengthscales = stdev_init
+
+        self.weighting_mask = None
+
+        self.DHT_loss = DeepCylinderLoss(img_size=(480, 640)) if self.dht_loss else None
     
     # def _fill(self, values: torch.Tensor):
     #     raise NotImplementedError("Must initialize the problem with a solution.")
 
+    def compute_weighting_mask(self, shape, center_weight=1.0, edge_weight=0.5):
+        """
+        Copied from your single-sample code: creates a weighting mask for the MSE.
+        shape: (H,W)
+        """
+        if USE_WEIGHTING_MASK:
+            h, w = shape
+            y, x = np.ogrid[:h, :w]
+            center_y, center_x = h / 2, w / 2
+            distance = np.sqrt((y - center_y) ** 2 + (x - center_x) ** 2)
+            max_distance = np.sqrt(center_y**2 + center_x**2)
+            normalized_distance = distance / max_distance
+            weights = edge_weight + (center_weight - edge_weight) * (
+                1 - normalized_distance
+            )
+            self.weighting_mask = torch.from_numpy(weights).float().to(self.model.device)
+
+        else:
+            self.weighting_mask = torch.ones(shape, dtype=torch.float32).to(self.model.device)
+
     def fine_search(self):
         self.render_loss = True
 
+    def coarse_search(self):
+        self.render_loss = False
+
     def update_problem(
-        self, ref_mask, ref_keypoints, det_line_params, joint_angles
+        self, ref_mask, ref_keypoints, det_line_params, joint_angles, stdev_init
     ):
         self.ref_mask = ref_mask
         self.ref_keypoints = ref_keypoints
         self.det_line_params = det_line_params
         self.joint_angles = joint_angles
+
+        if self.weighting_mask is None:
+            self.compute_weighting_mask(shape=self.ref_mask.shape)
+
+        # print(stdev_init)
+        if torch.is_tensor(stdev_init):
+            self.lengthscales = stdev_init.clone().detach()
+        else:
+            self.lengthscales = stdev_init
+
+        # Update the DHT loss with the reference mask
+        if self.dht_loss:
+            mask = ref_mask.repeat(3, 1, 1).unsqueeze(0)
+            self.DHT_loss.update_heatmap(mask)
+
+        # Compute distance map
+        if self.dist_weight > 0.:
+            mask = 1 - self.ref_mask.float()  # Invert the mask for the distance transform
+            v, lamb, iterations = 1e10, 0.0, 2 # Use Euclidean distance transform only
+            self.dist_map = FastGeodis.generalised_geodesic2d(
+                self.weighting_mask.unsqueeze(0).unsqueeze(0),
+                mask.unsqueeze(0).unsqueeze(0),
+                v, 
+                lamb,
+                iterations
+            ).squeeze()
+
+        # import matplotlib.pyplot as plt
+        # plt.imshow(self.dist_map.cpu().numpy())
+        # plt.show()
 
     def cylinder_loss_batch(
         self, position, direction, pose_matrix, radius
@@ -543,13 +783,25 @@ class PoseEstimationProblem(Problem):
 
         return cylinder_loss
 
+    @torch.no_grad()
     def _evaluate_batch(self, solutions: SolutionBatch):
-        values = solutions.values.clone()
+        values = solutions.values.clone() * self.lengthscales  # extract and scale the values by the lengthscales
         cTr_batch = values[:, :6]  # shape (B, 6)
         joint_angles = values[:, 6:]  # shape (B, 4)
         B = cTr_batch.shape[0]
 
+        if self.use_mix_angle:
+            mix_angle_batch = cTr_batch[:, :3]  # shape (B, 3)
+            axis_angle_batch = mix_angle_to_axis_angle(mix_angle_batch)  # shape
+            cTr_batch[:, :3] = axis_angle_batch  # replace the first 3 elements with axis-angle
+
         if self.render_loss:
+            # Obtain the weighting mask
+            weighting_mask = self.weighting_mask
+            weighting_mask = weighting_mask.unsqueeze(0).expand(
+                B, *[-1 for _ in weighting_mask.shape]
+            )
+
             self.ref_mask_b = self.ref_mask.unsqueeze(0).expand(
                 B, self.ref_mask.shape[0], self.ref_mask.shape[1]
             )
@@ -560,13 +812,33 @@ class PoseEstimationProblem(Problem):
             )  # shape (B,H,W)
 
             mse = F.mse_loss(
-                pred_masks_b,
-                self.ref_mask_b,
+                pred_masks_b * weighting_mask,
+                self.ref_mask_b * weighting_mask,
                 reduction="none",
             ).mean(dim=(1, 2))
 
+            # Compute distance loss
+            if self.dist_weight > 0.:
+                dist_map_ref = self.dist_map.unsqueeze(0).expand(
+                    B, *[-1 for _ in self.dist_map.shape]
+                )  # [B, H, W]
+                dist = torch.sum(
+                    (pred_masks_b * weighting_mask) * (dist_map_ref * weighting_mask), 
+                    dim=(1, 2)
+                )
+            else:
+                dist = 0.0
+
+            # Compute appearance loss
+            if self.app_weight > 0.:
+                sum_pred = torch.sum(pred_masks_b, dim=(1, 2))  # [B]
+                sum_ref = torch.sum(self.ref_mask_b, dim=(1, 2))
+                app = torch.abs(sum_pred - sum_ref) 
+            else:
+                app = 0.0
+
         else:
-            mse = 0.0
+            mse, dist, app = 0.0, 0.0, 0.0
 
         if self.kpts_loss:
             pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch)  # [B, 4, 4]
@@ -614,10 +886,41 @@ class PoseEstimationProblem(Problem):
                 radius,
             )  
 
+        elif self.dht_loss:
+            position = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
+            direction = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
+            direction[:, 2] = 1.0
+            pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch).squeeze(0)  # shape(B, 4, 4)
+            radius = 0.0085 / 2
+
+            # get the projected cylinder lines parameters
+            ref_mask = self.ref_mask
+            intr = self.intr
+
+            _, cam_pts_3d_position = transform_points_b(position, pose_matrix_b, intr)
+            _, cam_pts_3d_norm = transform_points_b(direction, pose_matrix_b, intr)
+            cam_pts_3d_norm = torch.nn.functional.normalize(
+                cam_pts_3d_norm
+            )  # NORMALIZE !!!!!!
+
+            # print(f"checking shape of cylinder input: {cam_pts_3d_position.shape, cam_pts_3d_norm.shape}")  both [B,3]
+            e_1, e_2 = projectCylinderTorch(
+                cam_pts_3d_position, cam_pts_3d_norm, radius, self.fx, self.fy, self.px, self.py
+            )  # [B,2], [B,2]
+            projected_lines = torch.stack((e_1, e_2), dim=1)  # [B, 2, 2]
+            
+            cylinder_val = self.DHT_loss(projected_lines) # maximize in the heatmap
+
         else:
             cylinder_val = 0.0
 
-        loss = self.mse_weight * mse + self.pts_weight * pts_val + self.cylinder_weight * cylinder_val
+        loss = (
+            self.mse_weight * mse
+            + self.dist_weight * dist
+            + self.app_weight * app
+            + self.pts_weight * pts_val 
+            + self.cylinder_weight * cylinder_val
+        )
 
         solutions.set_evals(loss)
 
@@ -632,9 +935,8 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
         super().__init__(model, robot_renderer, ref_mask, intr, p_local1, p_local2)
 
         self.joint_angles = joint_angles
-        self.DHT_loss = SmoothDeepCylinderLoss(img_size=(480, 640)) if self.dht_loss else None
 
-    def update_problem(self, ref_mask, ref_keypoints, det_line_params, joint_angles):
+    def update_problem(self, ref_mask, ref_keypoints, det_line_params, joint_angles, stdev_init):
         """
         Update the problem with the reference mask, keypoints, detected line parameters, and joint angles.
         """
@@ -642,6 +944,26 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
         self.ref_keypoints = ref_keypoints
         self.det_line_params = det_line_params
         self.joint_angles = joint_angles
+
+        if self.weighting_mask is None:
+            self.compute_weighting_mask(shape=self.ref_mask.shape)
+
+        # Compute distance map
+        mask = 1 - self.ref_mask.float()  # Invert the mask for the distance transform
+        v, lamb, iterations = 1e10, 0.0, 2 # Use Euclidean distance transform only
+        self.dist_map = FastGeodis.generalised_geodesic2d(
+            self.weighting_mask.unsqueeze(0).unsqueeze(0),
+            mask.unsqueeze(0).unsqueeze(0),
+            v, 
+            lamb,
+            iterations
+        ).squeeze()
+
+        # Convert stdev_init to lengthscales
+        if torch.is_tensor(stdev_init):
+            self.lengthscales = stdev_init.clone().detach()
+        else:
+            self.lengthscales = stdev_init
 
         # Update the DHT loss with the reference mask
         if self.dht_loss:
@@ -656,12 +978,25 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
         self.R_list = R_list.to(self.model.device)  # [4, 3, 3]
         self.t_list = t_list.to(self.model.device)  # [4, 3]
 
+    @torch.no_grad()
     def _evaluate_batch(self, solutions: SolutionBatch):
-        values = solutions.values.clone()
+        values = solutions.values.clone() * self.lengthscales  # extract and scale the values by the lengthscales
         cTr_batch = values[:, :6]  # shape (B, 6)
         B = cTr_batch.shape[0]
 
+        if self.use_mix_angle:
+            # print("[Using Euler angles for optimization. Converting to axis-angle representation.]")
+            mix_angle_batch = cTr_batch[:, :3]  # shape (B, 3)
+            axis_angle_batch = mix_angle_to_axis_angle(mix_angle_batch)  # shape
+            cTr_batch[:, :3] = axis_angle_batch  # replace the first 3 elements with axis-angle
+
         if self.render_loss:
+            # Obtain the weighting mask
+            weighting_mask = self.weighting_mask
+            weighting_mask = weighting_mask.unsqueeze(0).expand(
+                B, *[-1 for _ in weighting_mask.shape]
+            )
+
             self.ref_mask_b = self.ref_mask.unsqueeze(0).expand(
                 B, self.ref_mask.shape[0], self.ref_mask.shape[1]
             )
@@ -670,13 +1005,27 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
             )  # shape (B,H,W)
 
             mse = F.mse_loss(
-                pred_masks_b,
-                self.ref_mask_b,
+                pred_masks_b * weighting_mask,
+                self.ref_mask_b * weighting_mask,
                 reduction="none",
             ).mean(dim=(1, 2))
 
+            # Compute distance loss
+            dist_map_ref = self.dist_map.unsqueeze(0).expand(
+                B, *[-1 for _ in self.dist_map.shape]
+            )  # [B, H, W]
+            dist = torch.sum(
+                (pred_masks_b * weighting_mask) * (dist_map_ref * weighting_mask), 
+                dim=(1, 2)
+            )
+
+            # Compute appearance loss
+            sum_pred = torch.sum(pred_masks_b, dim=(1, 2))  # [B]
+            sum_ref = torch.sum(self.ref_mask_b, dim=(1, 2))
+            app = torch.abs(sum_pred - sum_ref) 
+
         else:
-            mse = 0.0
+            mse, dist, app = 0.0, 0.0, 0.0
 
         if self.kpts_loss:
             pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch)  # [B, 4, 4]
@@ -750,7 +1099,13 @@ class SimplePoseEstimationProblem(PoseEstimationProblem):
         else:
             cylinder_val = 0.0
 
-        loss = self.mse_weight * mse + self.pts_weight * pts_val + self.cylinder_weight * cylinder_val
+        loss = (
+            self.mse_weight * mse
+            + self.dist_weight * dist
+            + self.app_weight * app
+            + self.pts_weight * pts_val 
+            + self.cylinder_weight * cylinder_val
+        )
 
         solutions.set_evals(loss)
 
@@ -759,7 +1114,7 @@ class EvoTracker(Tracker):
     def __init__(
         self, model, robot_renderer, init_cTr, init_joint_angles, 
         num_iters=5, intr=None, p_local1=None, p_local2=None, 
-        stdev_init=5e-3, use_SNES=False, optimize_joint_angles=True
+        stdev_init=5e-3, use_CMAES=True, optimize_joint_angles=True
     ):
         super().__init__(model, robot_renderer, init_cTr, init_joint_angles, num_iters, intr, p_local1, p_local2)
 
@@ -771,101 +1126,128 @@ class EvoTracker(Tracker):
             self.model.use_antialiasing = False # do not use antialiasing as gradients are not needed
 
         if optimize_joint_angles:
-            self.problem = PoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2)
+            self.problem = PoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init)
         else:
-            self.problem = SimplePoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2)  # Problem will be set in track method
             self.stdev_init = self.stdev_init[:6] if isinstance(self.stdev_init, torch.Tensor) else self.stdev_init
+            self.problem = SimplePoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init)  # Problem will be set in track method
 
-        self.optimizer = SNES if use_SNES else XNES
+        self.optimizer = CMAES_cus if use_CMAES else XNES
 
-    def get_cylinder(self, mask):
-        ref_mask_np = mask.detach().cpu().numpy()
-        longest_lines = detect_lines(ref_mask_np, output=True)
-        longest_lines = np.array(longest_lines, dtype=np.float64)
-
-        if longest_lines.shape[0] < 2:
-            # Force skip cylinder or fallback
-            print(
-                "WARNING: Not enough lines found by Hough transform. Skipping cylinder loss."
-            )
-            # You can set self.det_line_params to None or some fallback
-            ret = None
-
+        # Transform the intial cTr to Euler angle if required
+        self.use_mix_angle = USE_MIX_ANGLE  
+        if self.use_mix_angle:
+            print("[Using transformed angle space for optimization.]")
+            axis_angle = self._prev_cTr[:3].unsqueeze(0)  # shape (1, 3)
+            mix_angle = axis_angle_to_mix_angle(axis_angle)  # Convert to Euler angles
+            self._prev_cTr[:3] = mix_angle.squeeze(0)  # Replace the first 3 elements with Euler angles
         else:
-            # print(f"debugging the longest lines {longest_lines}")
-            x1 = longest_lines[:, 0]
-            y1 = longest_lines[:, 1]
-            x2 = longest_lines[:, 2]
-            y2 = longest_lines[:, 3]
-            # print(f"debugging the end points x1: {x1}, y1: {y1}, x2: {x2}, y2: {y2}")
-            # Calculate line parameters (a, b, c) for detected lines
-            a = y2 - y1
-            b = x1 - x2
-            c = x1 * y2 - x2 * y1  # Determinant for the line equation
-
-            # Normalize to match the form au + bv = 1
-            # norm = c + 1e-6  # Ensure no division by zero
-            norm = np.abs(c)  # Compute the absolute value
-            norm = np.maximum(norm, 1e-6)  # Clamp to a minimum value of 1e-6
-            a /= norm
-            b /= norm
-
-            # Stack line parameters into a tensor and normalize to match au + bv = 1 form
-            detected_lines = torch.from_numpy(np.stack((a, b), axis=-1)).to(
-                self.model.device
-            )
-            ret = detected_lines
-
-        return ret
+            print("[Using axis-angle space for optimization.]")
 
     @torch.no_grad()
-    def track(self, mask, ref_img, joint_angles, visualization=False):
+    def track(self, mask, joint_angles, ref_keypoints, det_line_params, visualization=False):
         # Update the optimization problem
         ref_mask = mask.to(self.model.device)
-        ref_keypoints = None
-        if self.problem.kpts_loss:
-            ref_keypoints = get_reference_keypoints_auto(ref_img_path=None, ref_img=ref_img, num_keypoints=2)
-            ref_keypoints = torch.tensor(ref_keypoints).squeeze().float().cuda()
-        det_line_params = self.get_cylinder(mask) if self.problem.cylinder_loss else None
         self.problem.update_problem(
-            ref_mask, ref_keypoints, det_line_params, joint_angles
+            ref_mask, ref_keypoints, det_line_params, joint_angles, self.stdev_init
         )
         
         # Initialize the solution with the previous cTr and joint angles
         cTr = self._prev_cTr.clone()
+
         # joint_angles = self._prev_joint_angles.clone() # ignore the current joint angles
         center_init = torch.cat([cTr, joint_angles], dim=0)
 
         # Define the searcher and logger
         searcher = self.optimizer(
             problem=self.problem,
-            stdev_init=self.stdev_init if self.optimizer is not CMAES else 1e-3,
-            center_init=center_init,
-            popsize=50,
+            stdev_init=1.,
+            c_m=2.,
+            # c_sigma_ratio=2.,
+            # damp_sigma_ratio=2.,
+            # c_c_ratio=0.5,
+            # c_1_ratio=2.,
+            c_mu_ratio=2.,
+            center_init=center_init / self.problem.lengthscales,
+            popsize=70,
+            # mu_size=20 # only when using CMAES_cus
         )
-        logger = DummyLogger(searcher, interval=1, after_first_step=True)
+        searcher.mu = 10
+        logger = DummyLogger(searcher, interval=1, after_first_step=False)
+        # logger2 = StdOutLogger(searcher, interval=1, after_first_step=False)
 
-        # Run the optimization
-        num_coarse_steps = int(self.num_iters * 0.7)
-        num_fine_steps = self.num_iters - num_coarse_steps
-        searcher.run(num_coarse_steps)
-        searcher.problem.fine_search()  # Switch to fine search mode
-        searcher.run(num_fine_steps)
+        searcher.run(self.num_iters)
 
         # Extract the best solution and evaluation from the logger
-        best_solution = logger.best_solution
+        best_solution = logger.best_solution * self.problem.lengthscales
         cTr, joint_angles = best_solution[:6], best_solution[6:]
         loss = logger.best_eval
 
         # Update the previous cTr and joint angles
-        self._prev_cTr = cTr.detach()
-        self._prev_joint_angles = joint_angles.detach()
+        self._prev_cTr = cTr.clone()
+        self._prev_joint_angles = joint_angles.clone()
+
+        if self.use_mix_angle:
+            mix_angle = cTr[:3].unsqueeze(0)
+            axis_angle = mix_angle_to_axis_angle(mix_angle)  # Convert to axis-angle
+            cTr[:3] = axis_angle.squeeze(0) # Replace the first 3 elements with axis-angle
 
         if visualization:
             # Render the predicted mask for visualization
             robot_mesh = self.robot_renderer.get_robot_mesh(joint_angles)
             rendered_mask = self.model.render_single_robot_mask(cTr, robot_mesh, self.robot_renderer).squeeze(0)
-            overlay = self.overlay_mask(mask.detach(), rendered_mask.detach())
+
+            # Project keypoints
+            pose_matrix = self.model.cTr_to_pose_matrix(cTr.unsqueeze(0)).squeeze()
+            R_list, t_list = lndFK(joint_angles)
+            R_list = R_list.to(self.model.device)
+            t_list = t_list.to(self.model.device)
+            p_img1 = get_img_coords(
+                self.p_local1,
+                R_list[2],
+                t_list[2],
+                pose_matrix.to(joint_angles.dtype),
+                self.intr,
+            )
+            p_img2 = get_img_coords(
+                self.p_local2,
+                R_list[3],
+                t_list[3],
+                pose_matrix.to(joint_angles.dtype),
+                self.intr,
+            )
+            proj_keypoints = th.stack([p_img1, p_img2], dim=0)
+
+            # Project cylinders
+            cTr_batch = cTr.unsqueeze(0)  # shape (1, 6)
+            B = 1
+            position = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
+            direction = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
+            direction[:, 2] = 1.0
+            pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch).squeeze(0)  # shape(B, 4, 4)
+            radius = 0.0085 / 2
+            intr = self.intr
+            fx, fy, px, py = intr[0, 0].item(), intr[1, 1].item(), intr[0, 2].item(), intr[1, 2].item()
+
+            _, cam_pts_3d_position = transform_points(position, pose_matrix, intr)
+            _, cam_pts_3d_norm = transform_points(direction, pose_matrix, intr)
+            cam_pts_3d_norm = th.nn.functional.normalize(cam_pts_3d_norm)
+            e_1, e_2 = projectCylinderTorch(
+                cam_pts_3d_position, cam_pts_3d_norm, radius, fx, fy, px, py
+            )  # [B,2], [B,2]
+            projected_lines = torch.stack((e_1, e_2), dim=1)  # [B, 2, 2]
+
+            # print(det_line_params.shape, projected_lines.shape)
+
+            # Plot the overlay mask
+            overlay = self.overlay_mask(
+                mask.detach(), 
+                rendered_mask.detach(),
+                ref_pts=ref_keypoints,
+                proj_pts=proj_keypoints,
+                ref_lines=det_line_params.squeeze() if det_line_params is not None else None,
+                proj_lines=projected_lines.squeeze()
+            )
+
             return cTr.detach(), joint_angles.detach(), loss, overlay
         else:
             return cTr.detach(), joint_angles.detach(), loss, None

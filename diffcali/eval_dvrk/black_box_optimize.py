@@ -743,6 +743,7 @@ class PoseEstimationProblem(Problem):
         else:
             bbox_loss = 0.0
 
+        # print(10 * self.ld1, self.ld2 * 1e-7, self.ld3 * 1e-5)
         if use_aux_render_loss or use_geometry_loss or use_cv_loss:
             item_loss = (
                 10 * self.ld1 * mse_val
@@ -800,7 +801,10 @@ class BlackBoxOptimize:
         fx, fy, px, py, ld1, ld2, ld3, stdev_init=None, popsize=None, center_init=None, log_interval=5
     ):
 
-        ref_keypoints = torch.tensor(ref_keypoints).squeeze().to(model.device).float() # cannot be a list
+        if torch.is_tensor(ref_keypoints):
+            ref_keypoints = ref_keypoints.clone().detach().squeeze().to(model.device).float()
+        else:
+            ref_keypoints = torch.tensor(ref_keypoints).squeeze().to(model.device).float() # cannot be a list
 
         if not model.args.use_nvdiffrast or model.use_antialiasing:
             print("[Use NvDiffRast without antialiasing for black box optimization.]")

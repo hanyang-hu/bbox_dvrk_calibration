@@ -7,6 +7,8 @@ pip3 install torch torchvision torchaudio --index-url https://download.pytorch.o
 pip install -r requirements.txt
 pip install "git+https://github.com/facebookresearch/pytorch3d.git"
 pip install evotorch
+pip install FastGeodis --no-build-isolation
+pip install pykalman
 ```
 
 You also need to install [NvDiffRast](https://nvlabs.github.io/nvdiffrast/) following the instructions below (for Linux):

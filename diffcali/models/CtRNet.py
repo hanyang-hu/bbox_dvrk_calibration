@@ -173,7 +173,7 @@ class CtRNet(torch.nn.Module):
         pose_matrix = torch.zeros((batch_size, 4, 4), device=self.device)
         # print(f"debugging the ctr to pose {cTr.shape} ")
         pose_matrix[:, :3, :3] = (
-            kornia.geometry.conversions.angle_axis_to_rotation_matrix(cTr[:, :3])
+            kornia.geometry.conversions.axis_angle_to_rotation_matrix(cTr[:, :3])
         )
         pose_matrix[:, :3, 3] = cTr[:, 3:]
         pose_matrix[:, 3, 3] = 1
@@ -194,7 +194,7 @@ class CtRNet(torch.nn.Module):
         # print(f"check rotation_matrix {rotation_matrix.shape}")
 
         # Convert rotation matrix to angle-axis representation
-        angle_axis = kornia.geometry.conversions.rotation_matrix_to_angle_axis(
+        angle_axis = kornia.geometry.conversions.rotation_matrix_to_axis_angle(
             rotation_matrix
         )
 
@@ -330,7 +330,7 @@ class CtRNet(torch.nn.Module):
         # cTr: (6)
         # img: (1, H, W)
         # print(f"test ctr: {cTr}")
-        R = kornia.geometry.conversions.angle_axis_to_rotation_matrix(
+        R = kornia.geometry.conversions.axis_angle_to_rotation_matrix(
             cTr[:3][None]
         )  # (1, 3, 3)
         R = torch.transpose(R, 1, 2)
@@ -394,7 +394,7 @@ class CtRNet(torch.nn.Module):
         B = cTr_batch.shape[0]
 
         # 1) Convert angle-axis to rotation matrices (B,3,3), plus translation (B,3)
-        R_batched = kornia.geometry.conversions.angle_axis_to_rotation_matrix(
+        R_batched = kornia.geometry.conversions.axis_angle_to_rotation_matrix(
             cTr_batch[:, :3]
         )  # (B,3,3)
         # If your renderer expects the transpose or some different orientation, do R_batched = R_batched.transpose(1,2) if needed
@@ -428,7 +428,7 @@ class CtRNet(torch.nn.Module):
         B = cTr_batch.shape[0]
 
         # 1) Convert angle-axis to rotation matrices (B,3,3), plus translation (B,3)
-        R_batched = kornia.geometry.conversions.angle_axis_to_rotation_matrix(
+        R_batched = kornia.geometry.conversions.axis_angle_to_rotation_matrix(
             cTr_batch[:, :3]
         )  # (B,3,3)
         # If your renderer expects the transpose or some different orientation, do R_batched = R_batched.transpose(1,2) if needed

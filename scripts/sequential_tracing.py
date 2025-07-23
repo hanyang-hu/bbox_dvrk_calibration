@@ -1,6 +1,7 @@
 import argparse
 import numpy as np
-import torch 
+import kornia
+import torch
 import os
 import glob
 import cv2
@@ -12,10 +13,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from diffcali.models.CtRNet import CtRNet
 from diffcali.utils.ui_utils import *
-from diffcali.utils.detection_utils import detect_lines
 from diffcali.eval_dvrk.batch_optimize import BatchOptimize  # The class we just wrote
 from diffcali.eval_dvrk.optimize import Optimize  # Your single-sample class
 from diffcali.eval_dvrk.black_box_optimize import BlackBoxOptimize
+# from diffcali.utils.angle_transform_utils import mix_angle_to_axis_angle, axis_angle_to_mix_angle
 
 from diffcali.eval_dvrk.trackers import GradientTracker, EvoTracker
 
@@ -33,7 +34,7 @@ def parseArgs():
     parser.add_argument("--mesh_dir", type=str, default="urdfs/dVRK/meshes")
     parser.add_argument("--data_dir", type=str, default="data/consecutive_prediction/")  
     parser.add_argument("--difficulty", type=str, default="0617")
-    parser.add_argument("--frame_start", type=int, default=140) 
+    parser.add_argument("--frame_start", type=int, default=139) 
     parser.add_argument("--frame_end", type=int, default=160)  # End frame for the sequence
     parser.add_argument("--batch_opt_lr", type=float, default=3e-3)
     parser.add_argument("--single_opt_lr", type=float, default=5e-4) # if using gradient descent
@@ -52,11 +53,13 @@ def parseArgs():
     parser.add_argument("--online_iters", type=int, default=10)  # Number of iterations for online tracking
     parser.add_argument("--tracking_visualization", action="store_true")  # Whether to visualize the tracking process
     parser.add_argument("--online_lr", type=float, default=1e-3)  # Learning rate for online tracking
+    parser.add_argument("--use_filter", action="store_true")  # Use filter for tracking
 
     stdev_init = torch.tensor([1., 1., 1., 1., 1., 1., 1., 1., 1., 1.], dtype=torch.float32).cuda() # Initial standard deviation for XNES/SNES
-    stdev_init[:3] *= 1e-1 # angles (3D)
+    stdev_init[:3] *= torch.tensor([1e-2, 1e-1, 1e-2], dtype=torch.float32).cuda() # angles (3D) (REMARK: set to 1e-1 if using axis angles)
     stdev_init[3:6] *= 1e-3 # translations (3D)
-    stdev_init[6:] *= 1e-3 # joint angles (4D)
+    stdev_init[6:] *= 1e-2 # joint angles (4D)
+    stdev_init = stdev_init.detach()
     parser.add_argument("--stdev_init", type=RealOrVector, default=stdev_init)  # Standard deviation for initial noise in XNES
 
     parser.add_argument("--log_interval", type=int, default=1000)  # Logging interval for optimization
@@ -432,6 +435,14 @@ def initialization(model, init_data, mesh_files):
 
 
 if __name__ == "__main__":
+    import warnings
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*copy construct from a tensor.*",
+        category=UserWarning
+    )
+
     args = parseArgs()
     ctrnet_args = parseCtRNetArgs()
 
@@ -502,22 +513,34 @@ if __name__ == "__main__":
     # Track the rest of the frames
     loss_lst, time_lst = [], []
     for i in range(1, len(data_lst)):
-        # print(data_lst[i]["joint_angles"])
+        # Get keypoints and cylinder parameters
+        ref_keypoints, det_line_params = None, None
+        if tracker.problem.kpts_loss:
+            ref_keypoints = get_reference_keypoints_auto(ref_img_path=None, ref_img=data_lst[i]["ref_img"], num_keypoints=2)
+            ref_keypoints = torch.tensor(ref_keypoints).squeeze().float().cuda()
+        if tracker.problem.cylinder_loss or tracker.problem.dht_loss or args.tracking_visualization:
+            det_line_params = get_det_line_params(data_lst[i]["ref_mask"])
 
         start_time = time.time()
 
         # Track the current frame
-        cTr, joint_angles, loss, overlay = tracker.track(
-            mask=data_lst[i]["ref_mask"],
-            ref_img=data_lst[i]["ref_img"], # for cv2 operatiosn
-            joint_angles=data_lst[i]["joint_angles"],
-            visualization=args.tracking_visualization,
-        )
+        if not args.use_filter:
+            cTr, joint_angles, loss, overlay = tracker.track(
+                mask=data_lst[i]["ref_mask"],
+                joint_angles=data_lst[i]["joint_angles"],
+                ref_keypoints=ref_keypoints,
+                det_line_params=det_line_params,
+                visualization=args.tracking_visualization,
+            )
+
+        else:
+            pass
 
         end_time = time.time()
 
         # Save the overlay image
         if args.tracking_visualization:
+            # overlay = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for OpenCV
             overlay_path = os.path.join("./tracking/", f"overlay_{i}.png")
             os.makedirs(os.path.dirname(overlay_path), exist_ok=True)
             cv2.imwrite(overlay_path, overlay)

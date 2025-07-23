@@ -3,6 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch as th
 
+from diffcali.utils.detection_utils import detect_lines
+
+
 def click_event(event, x, y, flags, params):
     if event == cv2.EVENT_LBUTTONDOWN:
         # Store the clicked coordinates
@@ -88,6 +91,41 @@ def get_reference_keypoints_auto(ref_img_path, num_keypoints=2, ref_img=None):
     return ref_keypoints.squeeze(1).tolist()  # Convert to list of tuples
 
 
+def get_det_line_params(mask):
+    ref_mask_np = mask.detach().cpu().numpy()
+    longest_lines = detect_lines(ref_mask_np, output=True)
+    longest_lines = np.array(longest_lines, dtype=np.float64)
+
+    if longest_lines.shape[0] < 2:
+        print(
+            "WARNING: Not enough lines found by Hough transform. Skipping cylinder loss."
+        )
+        ret = None
+
+    else:
+        # print(f"debugging the longest lines {longest_lines}")
+        x1 = longest_lines[:, 0]
+        y1 = longest_lines[:, 1]
+        x2 = longest_lines[:, 2]
+        y2 = longest_lines[:, 3]
+        # print(f"debugging the end points x1: {x1}, y1: {y1}, x2: {x2}, y2: {y2}")
+        # Calculate line parameters (a, b, c) for detected lines
+        a = y2 - y1
+        b = x1 - x2
+        c = x1 * y2 - x2 * y1  # Determinant for the line equation
+
+        # Normalize to match the form au + bv = 1
+        # norm = c + 1e-6  # Ensure no division by zero
+        norm = np.abs(c)  # Compute the absolute value
+        norm = np.maximum(norm, 1e-6)  # Clamp to a minimum value of 1e-6
+        a /= norm
+        b /= norm
+
+        # Stack line parameters into a tensor and normalize to match au + bv = 1 form
+        detected_lines = th.from_numpy(np.stack((a, b), axis=-1)).cuda()
+        ret = detected_lines
+
+    return ret
 
 
 

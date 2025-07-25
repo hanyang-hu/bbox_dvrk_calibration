@@ -18,14 +18,20 @@ from diffcali.eval_dvrk.optimize import Optimize  # Your single-sample class
 from diffcali.eval_dvrk.black_box_optimize import BlackBoxOptimize
 # from diffcali.utils.angle_transform_utils import mix_angle_to_axis_angle, axis_angle_to_mix_angle
 
-from diffcali.eval_dvrk.trackers import GradientTracker, EvoTracker
+from diffcali.eval_dvrk.trackers import Tracker
 
 from evotorch.tools.misc import RealOrVector # Union[float, Iterable[float], torch.Tensor]
 
-trackers = {
-    "gradient": GradientTracker,
-    "evolution": EvoTracker,
-}
+from contextlib import contextmanager
+
+@contextmanager
+def maybe_no_grad(condition: bool):
+    if condition:
+        with torch.no_grad():
+            yield
+    else:
+        yield
+
 
 torch.cuda.empty_cache()
 
@@ -49,7 +55,7 @@ def parseArgs():
     parser.add_argument("--sample_number", type=int, default=200)
     parser.add_argument("--use_nvdiffrast", action="store_true")
     parser.add_argument("--use_bbox_optimizer", action="store_true") # Use XNES for initialization
-    parser.add_argument("--tracker", type=str, default="evolution", choices=list(trackers.keys()))
+    parser.add_argument("--searcher", type=str, default="CMA-ES", choices=["CMA-ES", "XNES", "SNES", "Gradient", "Nelder-Mead", "RandomSearch"])  # Search algorithm to use
     parser.add_argument("--online_iters", type=int, default=10)  # Number of iterations for online tracking
     parser.add_argument("--tracking_visualization", action="store_true")  # Whether to visualize the tracking process
     parser.add_argument("--online_lr", type=float, default=1e-3)  # Learning rate for online tracking
@@ -494,65 +500,63 @@ if __name__ == "__main__":
     gc.collect()
     torch.cuda.empty_cache()
 
-    tracker = trackers[args.tracker](
-        model=model,
-        robot_renderer=robot_renderer,
-        init_cTr=cTr,
-        init_joint_angles=joint_angles,
-        num_iters=args.online_iters,
-        intr=intr,
-        p_local1=p_local1,
-        p_local2=p_local2,
-    )
+    with maybe_no_grad(args.searcher in ["CMA-ES", "XNES", "SNES", "Nelder-Mead", "RandomSearch"]):
+        tracker = Tracker(
+            model=model,
+            robot_renderer=robot_renderer,
+            init_cTr=cTr,
+            init_joint_angles=joint_angles,
+            num_iters=args.online_iters,
+            stdev_init=args.stdev_init,
+            intr=intr,
+            p_local1=p_local1,
+            p_local2=p_local2,
+            searcher=args.searcher,
+        )
 
-    if args.tracker == "gradient":
-        tracker.lr = args.online_lr  # Set the learning rate for gradient descent
-    if args.tracker == "evolution":
-        tracker.stdev_init = args.stdev_init
+        # Track the rest of the frames
+        loss_lst, time_lst = [], []
+        for i in range(1, len(data_lst)):
+            # Get keypoints and cylinder parameters
+            ref_keypoints, det_line_params = None, None
+            if tracker.problem.kpts_loss:
+                ref_keypoints = get_reference_keypoints_auto(ref_img_path=None, ref_img=data_lst[i]["ref_img"], num_keypoints=2)
+                ref_keypoints = torch.tensor(ref_keypoints).squeeze().float().cuda()
+            if tracker.problem.cylinder_loss or tracker.problem.dht_loss or args.tracking_visualization:
+                det_line_params = get_det_line_params(data_lst[i]["ref_mask"])
 
-    # Track the rest of the frames
-    loss_lst, time_lst = [], []
-    for i in range(1, len(data_lst)):
-        # Get keypoints and cylinder parameters
-        ref_keypoints, det_line_params = None, None
-        if tracker.problem.kpts_loss:
-            ref_keypoints = get_reference_keypoints_auto(ref_img_path=None, ref_img=data_lst[i]["ref_img"], num_keypoints=2)
-            ref_keypoints = torch.tensor(ref_keypoints).squeeze().float().cuda()
-        if tracker.problem.cylinder_loss or tracker.problem.dht_loss or args.tracking_visualization:
-            det_line_params = get_det_line_params(data_lst[i]["ref_mask"])
+            start_time = time.time()
 
-        start_time = time.time()
+            # Track the current frame
+            if not args.use_filter:
+                cTr, joint_angles, loss, overlay = tracker.track(
+                    mask=data_lst[i]["ref_mask"],
+                    joint_angles=data_lst[i]["joint_angles"],
+                    ref_keypoints=ref_keypoints,
+                    det_line_params=det_line_params,
+                    visualization=args.tracking_visualization,
+                )
 
-        # Track the current frame
-        if not args.use_filter:
-            cTr, joint_angles, loss, overlay = tracker.track(
-                mask=data_lst[i]["ref_mask"],
-                joint_angles=data_lst[i]["joint_angles"],
-                ref_keypoints=ref_keypoints,
-                det_line_params=det_line_params,
-                visualization=args.tracking_visualization,
-            )
+            else:
+                pass
 
-        else:
-            pass
+            end_time = time.time()
 
-        end_time = time.time()
+            # Save the overlay image
+            if args.tracking_visualization:
+                # overlay = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for OpenCV
+                overlay_path = os.path.join("./tracking/", f"overlay_{i}.png")
+                os.makedirs(os.path.dirname(overlay_path), exist_ok=True)
+                cv2.imwrite(overlay_path, overlay)
 
-        # Save the overlay image
-        if args.tracking_visualization:
-            # overlay = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for OpenCV
-            overlay_path = os.path.join("./tracking/", f"overlay_{i}.png")
-            os.makedirs(os.path.dirname(overlay_path), exist_ok=True)
-            cv2.imwrite(overlay_path, overlay)
+            loss_lst.append(loss)
+            time_lst.append(end_time - start_time)
 
-        loss_lst.append(loss)
-        time_lst.append(end_time - start_time)
+            print(f"Frame {i} - Loss: {loss:.4f}, Time: {end_time - start_time:.4f} seconds")
 
-        print(f"Frame {i} - Loss: {loss:.4f}, Time: {end_time - start_time:.4f} seconds")
-
-    # Print the average MSE and time
-    avg_loss = np.mean(loss_lst)
-    avg_time = np.mean(time_lst)
-    print(f"Average Loss: {avg_loss:.4f}")
-    print(f"Average Time: {avg_time:.4f} seconds")
-    print("Tracking completed.")
+        # Print the average MSE and time
+        avg_loss = np.mean(loss_lst)
+        avg_time = np.mean(time_lst)
+        print(f"Average Loss: {avg_loss:.4f}")
+        print(f"Average Time: {avg_time:.4f} seconds")
+        print("Tracking completed.")

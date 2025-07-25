@@ -75,6 +75,7 @@ def mix_angle_to_axis_angle(mix_angle: torch.Tensor) -> torch.Tensor:
 
     return axis_angle  # (B,3)
 
+
 @torch.compile()
 def axis_angle_to_mix_angle(axis_angle: torch.Tensor) -> torch.Tensor:
     """
@@ -109,3 +110,47 @@ def axis_angle_to_mix_angle(axis_angle: torch.Tensor) -> torch.Tensor:
     gamma = torch.atan2(r02 / cos_alpha, r22 / cos_alpha)
 
     return torch.stack([alpha, beta, gamma], dim=-1)
+
+
+def unscented_mix_angle_to_axis_angle(mix_angle: torch.Tensor, stdev: torch.Tensor) -> torch.Tensor:
+    """
+    Use Unscented Transform to convert mix angles to axis-angle representation.
+    Input:
+        mix_angle: (3,) torch.Tensor with angles [alpha, beta, gamma] in radians
+        stdev: (3,) torch.Tensor with standard deviations for each angle
+    Output:
+        mean: (3,) torch.Tensor with mean axis-angle vector
+        cov: (3,3) torch.Tensor with covariance of the axis-angle vector
+    """
+    D = 3
+    assert mix_angle.shape == (3,)
+    assert stdev.shape == (3,)
+
+    # Generate sigma points for each batch element
+    c = torch.sqrt(torch.tensor(3.0, device=stdev.device))  # scaling factor
+    sigma_offsets = torch.stack([
+        torch.zeros(3, device=stdev.device),             # mean
+        c * stdev * torch.tensor([1, 0, 0], device=stdev.device),
+        c * stdev * torch.tensor([0, 1, 0], device=stdev.device),
+        c * stdev * torch.tensor([0, 0, 1], device=stdev.device),
+        -c * stdev * torch.tensor([1, 0, 0], device=stdev.device),
+        -c * stdev * torch.tensor([0, 1, 0], device=stdev.device),
+        -c * stdev * torch.tensor([0, 0, 1], device=stdev.device),
+    ]) 
+    sigma_points = mix_angle[None, :] + sigma_offsets  # (7, 3)
+
+    # Transform sigma points to axis-angle
+    sigma_transformed = mix_angle_to_axis_angle(sigma_points) # (7, 3)
+
+    # Weights for UT (symmetric)
+    Wm = torch.full((2 * D + 1,), 1.0 / (2 * D), device=mix_angle.device)
+    Wm[0] = 0.0  # no weight for the center if desired
+    Wc = Wm.clone()
+
+    # Compute mean and covariance
+    mean = torch.sum(Wm[:, None] * sigma_transformed, dim=0)  # (3,)
+    diffs = sigma_transformed - mean[None, :]  # (7, 3)
+    cov = torch.einsum("i,ij,ik->jk", Wc, diffs, diffs)  # (3, 3)
+
+    return mean, cov
+

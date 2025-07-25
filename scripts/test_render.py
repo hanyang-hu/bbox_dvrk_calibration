@@ -3,9 +3,10 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from diffcali.models.CtRNet import CtRNet
-from diffcali.utils.euler_angle_utils import (
-    euler_angle_to_axis_angle,
-    axis_angle_to_euler_angle
+from diffcali.utils.angle_transform_utils import (
+    mix_angle_to_axis_angle,
+    axis_angle_to_mix_angle,
+    unscented_mix_angle_to_axis_angle
 )
 
 import math
@@ -18,6 +19,34 @@ import cv2
 import argparse
 import time
 import warnings
+
+
+def smallest_diag_dominating_A_cvxpy(A: np.ndarray) -> np.ndarray:
+    import cvxpy
+    """
+    Given symmetric matrix A (3x3),
+    find diagonal D = diag(d) minimizing sum(d)
+    s.t. D - A is positive semidefinite.
+
+    Returns:
+        D: smallest diagonal matrix dominating A
+    """
+    assert A.shape == (3, 3)
+    assert np.allclose(A, A.T, atol=1e-8), "A must be symmetric"
+
+    d = cp.Variable(3, nonneg=True)  # diagonal entries
+
+    D = cp.diag(d)
+    constraints = [D - A >> 0]  # PSD constraint
+
+    prob = cp.Problem(cp.Minimize(cp.sum(d)), constraints)
+    prob.solve(solver=cp.SCS)  # or cp.MOSEK if available
+
+    if prob.status not in ["optimal", "optimal_inaccurate"]:
+        raise RuntimeError("Solver did not find an optimal solution")
+
+    D_opt = np.diag(d.value)
+    return D_opt
 
 
 def parseArgs():
@@ -189,8 +218,8 @@ if __name__ == "__main__":
         print(f"All ctr candiates: {cTr_batch.shape}")
 
         angle_axis_batch = cTr_batch[:, :3]  # Extract axis-angle part
-        euler_angle_batch = axis_angle_to_euler_angle(angle_axis_batch)  # Convert to Euler angles
-        axis_angle_converted = euler_angle_to_axis_angle(euler_angle_batch)
+        mix_angle_batch = axis_angle_to_mix_angle(angle_axis_batch)  # Convert to Euler angles
+        axis_angle_converted = mix_angle_to_axis_angle(mix_angle_batch)
 
         # Test the conversion accuracy
         R = kornia.geometry.conversions.axis_angle_to_rotation_matrix(angle_axis_batch)
@@ -222,8 +251,8 @@ if __name__ == "__main__":
         resolution = (args.height, args.width)
 
         # b.2) Prepare data for rendering (using utils in PyTorch3D)
-        # euler_angle_batch[:,2] += torch.pi / 3 # local roll
-        # axis_angle_converted = euler_angle_to_axis_angle(euler_angle_batch)  # Convert back to axis-angle
+        # mix_angle_batch[:,2] += torch.pi / 3 # local roll
+        # axis_angle_converted = mix_angle_to_axis_angle(mix_angle_batch)  # Convert back to axis-angle
         cTr_batch[:, :3] = axis_angle_converted  # Update the axis-angle part with converted values
 
         R_batched = kornia.geometry.conversions.angle_axis_to_rotation_matrix(
@@ -252,15 +281,62 @@ if __name__ == "__main__":
         pred_masks_nv = render(glctx, pos, pos_idx[0], resolution) # shape is [B, H, W]
         end_time = time.time()
 
+        # Project the origin (the translation vector) to the image plane
+        fx, fy = args.fx, args.fy
+        px, py = args.px, args.py
+
+        # View-space coordinates of the origin in camera frame (R @ 0 + T)
+        origin_camera = T_batched_  # (B, 3)
+
+        # Project to pixel coordinates
+        x = fx * (origin_camera[:, 0] / origin_camera[:, 2]) + px
+        y = fy * (origin_camera[:, 1] / origin_camera[:, 2]) + py
+
+        origin_proj = torch.stack([x, y], dim=-1)  # shape [B, 2]
+        origin_proj_int = origin_proj.round().to(torch.int32)
+
         print(f"Predicted masks (NvDiffRast): {pred_masks_nv.shape}")
         print(f"Batch Rendering Time (NvDiffRast): {(end_time - start_time) * 1000 :.4f} ms")
         
         # Display the images 
         pred_masks = pred_masks.cpu().numpy()
         pred_masks_nv = pred_masks_nv.cpu().numpy()
-        for i in range(min(10, args.sample_number)):
+        for i in range(min(0, args.sample_number)):
             img = np.zeros((args.height, args.width, 3), dtype=np.uint8)
             img[..., 0] = (pred_masks[i] * 255).astype(np.uint8) # blue for PyTorch3D
             img[..., 2] = (pred_masks_nv[i] * 255).astype(np.uint8) # red for NvDiffRast
+            # Draw the origin point
+            u, v = origin_proj_int[i]
+            if 0 <= u < args.width and 0 <= v < args.height:
+                cv2.circle(img, (u.item(), v.item()), 5, (0, 255, 0), -1)  # green for origin
+            cv2.putText(img, f"Sample {i+1}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             cv2.imshow("Predicted Masks", img)
             cv2.waitKey(0)
+
+        # Test unscented mix angle to axis-angle conversion
+        for i in range(args.sample_number):
+            test_mix_angle = mix_angle_batch[i]
+            stdev = torch.tensor([1e-2, 1e-1, 1e-2], dtype=torch.float32).cuda()
+            mean_axis_angle, cov_axis_angle = unscented_mix_angle_to_axis_angle(test_mix_angle, stdev)
+            print("Mean:\n", mean_axis_angle)
+            print("Covariance:\n", cov_axis_angle)
+
+            # Compare with empirical mean and covariance
+            generated_mix_angles = test_mix_angle + stdev * torch.randn(1000, 3).cuda()
+            generated_axis_angles = mix_angle_to_axis_angle(generated_mix_angles)
+            empirical_mean = generated_axis_angles.mean(dim=0)
+            empirical_cov = torch.cov(generated_axis_angles.T)
+            print("Empirical Mean:\n", empirical_mean)
+            print("Empirical Covariance:\n", empirical_cov)
+
+            # Compute a diagonal stdev based on d_ii = sqrt(a_ii + \sum_{i\not=j} a_ij)
+            diag = torch.diag(cov_axis_angle)  # shape (n,)
+            off_diag_sum = torch.sum(torch.abs(cov_axis_angle), dim=1) - torch.abs(diag)
+            diagonal_stdev = torch.sqrt(diag + off_diag_sum)
+            print("Diagonal Stdev:\n", diagonal_stdev)
+
+            # # Use CVXPY to find the smallest diagonal matrix dominating the covariance
+            # A = cov_axis_angle.cpu().numpy()
+            # D_opt = smallest_diag_dominating_A_cvxpy(A)
+            # opt_diagonal_stdev = torch.tensor(np.sqrt(np.diag(D_opt)), dtype=torch.float32).cuda()
+            # print("Optimal Diagonal Stdev (CVXPY):\n", opt_diagonal_stdev)

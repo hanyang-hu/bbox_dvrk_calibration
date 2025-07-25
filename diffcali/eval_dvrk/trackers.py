@@ -24,7 +24,7 @@ from diffcali.utils.angle_transform_utils import (
 from diffcali.utils.cma_es import CMAES_cus
 
 from evotorch import Problem, SolutionBatch
-from evotorch.algorithms import SNES, XNES, CMAES
+from evotorch.algorithms import SearchAlgorithm, SNES, XNES, CMAES
 from evotorch.logging import Logger, StdOutLogger
 
 
@@ -200,412 +200,6 @@ def cylinder_loss_params(detected_lines, projected_lines):
     return line_loss  # [B]
 
 
-class Tracker:
-    def __init__(
-        self, model, robot_renderer, init_cTr, init_joint_angles, 
-        num_iters=5, intr=None, p_local1=None, p_local2=None, 
-    ):
-        self.model = model
-        self.robot_renderer = robot_renderer
-
-        self._prev_cTr = init_cTr
-        self._prev_joint_angles = init_joint_angles
-        self.num_iters = num_iters
-
-        self.num_iters = num_iters # number of iterations for optimization
-
-        self.intr = intr  
-        self.p_local1 = p_local1  
-        self.p_local2 = p_local2 
-
-        self.fx, self.fy, self.px, self.py = intr[0, 0].item(), intr[1, 1].item(), intr[0, 2].item(), intr[1, 2].item()
-
-    def track(self, mask, joint_angles, ref_keypoints, num_iters=5):
-        """
-        Inputs:
-        - mask: The reference mask (from the segmentation module).
-        - joint_angles: The joint angles read (may be inaccurate for cable-driven robots).
-        - ref_keypoints: Keypoints in the reference image for tracking.
-        - num_iters: Number of iterations for optimization.
-        Outputs:
-        - cTr: The 6D pose of the robot.
-        - joint_angles: The optimized joint angles.
-        - mse: The mean squared error between the rendered mask and the reference mask.
-        - overlay: An overlay image of the predicted mask on the reference mask for visualization.
-        """
-        raise NotImplementedError("Tracking method not implemented.")
-
-    def overlay_mask(self, ref_mask, pred_mask, ref_pts=None, proj_pts=None, ref_lines=None, proj_lines=None):
-        """
-        Overlay the predicted mask on the reference mask for visualization.
-        """
-        # Convert masks to grayscale images
-        ref_mask = ref_mask.float().cpu().numpy()
-        pred_mask = pred_mask.float().cpu().numpy()
-        # ref_mask = (ref_mask*255).astype(np.uint8)
-        # pred_mask = (pred_mask*255).astype(np.uint8)
-
-        w, h = ref_mask.shape[1], ref_mask.shape[0]
-        
-        # Create a color overlay
-        # rendered_color = np.stack([0.5 * pred_mask, 0.8 * pred_mask, np.zeros_like(pred_mask)], axis=-1) # Light blue for rendered mask
-        # ref_color = np.stack([ref_mask, 0.6 * ref_mask, 0.1 * ref_mask], axis=-1)  # Orange for reference mask
-        # overlay = rendered_color * 0.5 + ref_color * 0.5
-        # # overlay = np.clip(overlay, 0, 1)
-        # overlay = (overlay * 255).astype(np.uint8)
-        # overlay = np.clip(overlay, 0, 255)
-        overlay = np.zeros((h, w, 3), dtype=np.uint8)  # Create an empty overlay image
-        overlay[..., 0] = (ref_mask * 255).astype(np.uint8)  # Blue channel 
-        overlay[..., 2] = (pred_mask * 255).astype(np.uint8)  # Green channel
-
-        if ref_pts != None:
-            center_ref_pt = th.mean(ref_pts, dim=0)
-            for ref_pt in ref_pts:
-                u_ref, v_ref = int(ref_pt[0]), int(ref_pt[1])
-                cv2.circle(
-                    overlay,
-                    (u_ref, v_ref),
-                    radius=5,
-                    color=(255, 0.6 * 255, 0.1 * 255),
-                    thickness=-1,
-                )  # Green
-
-            u_ref, v_ref = int(center_ref_pt[0]), int(center_ref_pt[1])
-            cv2.circle(
-                overlay,
-                (u_ref, v_ref),
-                radius=5,
-                color=(255, 0.6 * 255, 0.1 * 255),
-                thickness=-1,
-            )  # Green  BGR
-            # Draw projected keypoints in red
-
-        if proj_pts is not None:
-            center_proj_pt = th.mean(proj_pts, dim=0)
-            for proj_pt in proj_pts.squeeze():
-                # print(f"debugging the project pts {proj_pts}")
-                u_proj, v_proj = int(proj_pt[0].item()), int(proj_pt[1].item())
-                cv2.circle(
-                    overlay, (u_proj, v_proj), radius=5, color=(255*0.1, 255*0.6, 255), thickness=-1
-                )  # Red
-
-            u_ref, v_ref = int(center_proj_pt[0]), int(center_proj_pt[1])
-            cv2.circle(
-                overlay, (u_ref, v_ref), radius=5, color=(255*0.1, 255*0.6, 255), thickness=-1
-            )  # Green
-
-        # Draw detected lines in blue (convert from line parameters to endpoints)
-        if ref_lines is not None:
-            for line_params in ref_lines:
-                a, b = line_params
-                (x1, y1), (x2, y2) = convert_line_params_to_endpoints(a.item(), b.item(), w, h)
-                cv2.line(
-                    overlay,
-                    (x1, y1),
-                    (x2, y2),
-                    (255, 0.6 * 255, 0.1 * 255),
-                    thickness=2,
-                ) 
-
-        # Draw projected lines in cyan (convert from line parameters to endpoints)
-        if proj_lines is not None:
-            for line_params in proj_lines:
-                a, b = line_params
-                (x1, y1), (x2, y2) = convert_line_params_to_endpoints(a, b, w, h)
-                cv2.line(
-                    overlay, (x1, y1), (x2, y2), (255*0.1, 255*0.6, 255), thickness=2
-                ) 
-
-
-        return overlay
-
-
-class GradientTracker(Tracker):
-    def __init__(self, model, robot_renderer, init_cTr, init_joint_angles, num_iters=5, intr=None, p_local1=None, p_local2=None, lr=5e-4):
-        super().__init__(model, robot_renderer, init_cTr, init_joint_angles, num_iters, intr, p_local1, p_local2)
-
-        self.lr = lr # learning rate for Adam optimization
-
-        # self.model.args.use_nvdiffrast = False # use PyTorch3D renderer instead
-
-        if self.model.args.use_nvdiffrast and not self.model.use_antialiasing:
-            print("[Antialiasing is not enabled in the NvDiffRast renderer. This may lead to inaccurate gradients.]")
-            print("[Enabling antialiasing for better gradients.]")
-            self.model.use_antialiasing = True # use antialiasing for better gradients
-
-        self.render_loss = USE_RENDER_LOSS
-        self.kpts_loss = USE_PTS_LOSS
-        self.cylinder_loss = USE_CYD_LOSS
-
-        self.mse_weight = MSE_WEIGHT  # weight for the MSE loss
-        self.pts_weight = PTS_WEIGHT  # weight for the keypoint loss
-        self.cylinder_weight = CYD_WEIGHT  # weight for the cylinder loss
-
-    def keypoint_chamfer_loss(self, keypoints_a, keypoints_b, pts=True):
-        # Expand dimensions for broadcasting
-        pts_a = keypoints_a
-        pts_b = keypoints_b
-
-        if keypoints_a.size(0) != 2 or keypoints_b.size(0) != 2:
-            raise ValueError(
-                "This brute force method only works for exactly two keypoints in each set."
-            )
-
-        # Compute distances for both possible permutations:
-        # Permutation 1: A0->B0 and A1->B1
-        dist_1 = th.norm(keypoints_a[0] - keypoints_b[0]) + th.norm(
-            keypoints_a[1] - keypoints_b[1]
-        )
-
-        # Permutation 2: A0->B1 and A1->B0
-        dist_2 = th.norm(keypoints_a[0] - keypoints_b[1]) + th.norm(
-            keypoints_a[1] - keypoints_b[0]
-        )
-
-        # Choose the pairing that results in minimal distance
-        min_dist = th.min(dist_1, dist_2)
-
-        # Align the centerline:
-        centerline_loss = th.norm(th.mean(pts_a, dim=0) - th.mean(pts_b, dim=0))
-
-        # print(f"debugging loss scale....{chamfer_loss, parallelism_loss, distance_constraint_loss}")
-        if pts == True:
-            return min_dist + centerline_loss
-        else:
-            # print(f"checking the cylinder loss scale: {chamfer_loss, centerline_loss}")
-            return min_dist
-
-    def cylinder_loss_single(self, ref_mask, position, direction, pose_matrix, radius):
-        # get the projected cylinder lines parameters
-
-        intr = self.intr
-
-        _, cam_pts_3d_position = transform_points(position, pose_matrix, intr)
-        _, cam_pts_3d_norm = transform_points(direction, pose_matrix, intr)
-        cam_pts_3d_norm = th.nn.functional.normalize(cam_pts_3d_norm)
-        e_1, e_2 = projectCylinderTorch(
-            cam_pts_3d_position, cam_pts_3d_norm, radius, self.fx, self.fy, self.px, self.py
-        )  # [1,2], [1,2]
-        projected_lines = th.cat((e_1, e_2), dim=0)
-
-        # print(f"debugging the line params: {detected_lines}")
-        self.proj_line_params = projected_lines
-        detected_lines = self.det_line_params
-
-        # print(f"checking the shape of detected and projected lines {detected_lines}, {projected_lines}")  # [2, 2] [2, 2]
-        cylinder_loss = cylinder_loss_params(detected_lines.unsqueeze(0), projected_lines.unsqueeze(0)) if detected_lines is not None else 0.0
-        # parallelism = angle_between_lines(projected_lines, detected_lines)
-        # print(f"testing line angle...{parallelism}")
-        return cylinder_loss
-        
-    def track(self, mask, ref_img, joint_angles, visualization=False):
-        ref_mask_np = mask.detach().cpu().numpy()
-
-        if self.kpts_loss:
-            ref_keypoints = get_reference_keypoints_auto(ref_img_path=None, ref_img=ref_img, num_keypoints=2)
-            ref_keypoints = torch.tensor(ref_keypoints).squeeze().float().cuda()
-        else:
-            ref_keypoints = None
-
-        if self.cylinder_loss:
-            longest_lines = detect_lines(ref_mask_np, output=True) 
-
-            longest_lines = np.array(longest_lines, dtype=np.float64)
-
-            if longest_lines.shape[0] < 2:
-                # Force skip cylinder or fallback
-                print(
-                    "WARNING: Not enough lines found by Hough transform. Skipping cylinder loss."
-                )
-                # You can set self.det_line_params to None or some fallback
-                self.det_line_params = None
-
-            else:
-                # print(f"debugging the longest lines {longest_lines}")
-                x1 = longest_lines[:, 0]
-                y1 = longest_lines[:, 1]
-                x2 = longest_lines[:, 2]
-                y2 = longest_lines[:, 3]
-                # print(f"debugging the end points x1: {x1}, y1: {y1}, x2: {x2}, y2: {y2}")
-                # Calculate line parameters (a, b, c) for detected lines
-                a = y2 - y1
-                b = x1 - x2
-                c = x1 * y2 - x2 * y1  # Determinant for the line equation
-
-                # Normalize to match the form au + bv = 1
-                # norm = c + 1e-6  # Ensure no division by zero
-                norm = np.abs(c)  # Compute the absolute value
-                norm = np.maximum(norm, 1e-6)  # Clamp to a minimum value of 1e-6
-                a /= norm
-                b /= norm
-
-                # Stack line parameters into a tensor and normalize to match au + bv = 1 form
-                detected_lines = torch.from_numpy(np.stack((a, b), axis=-1)).to(
-                    self.model.device
-                )
-                self.det_line_params = detected_lines
-        else:
-            self.det_line_params = None
-
-        cTr = self._prev_cTr.clone()
-        axis, xyz = cTr[:3], cTr[3:]  # split the cTr into axis and xyz
-        # joint_angles = self._prev_joint_angles.clone() # ignore the current joint angles
-
-        axis.requires_grad = True
-        xyz.requires_grad = True
-        # joint_angles.requires_grad = True
-
-        optimizer = torch.optim.Adam(
-            [
-                {
-                    "params": axis,
-                    "lr": self.lr * 50.,
-                },
-                {
-                    "params": xyz,
-                    "lr": self.lr,
-                },
-                # {
-                #     "params": joint_angles,
-                #     "lr": self.lr,
-                # },
-            ]
-        )   
-
-        for _ in range(self.num_iters):
-            optimizer.zero_grad()
-
-            cTr = th.cat((axis, xyz), dim=0)  # concatenate axis and xyz to form cTr
-
-            if self.render_loss:
-                self.robot_mesh = self.robot_renderer.get_robot_mesh(joint_angles) 
-
-                rendered_mask = self.model.render_single_robot_mask(cTr, self.robot_mesh, self.robot_renderer).squeeze(0) 
-
-                mse = F.mse_loss(rendered_mask, mask)
-            
-            else:
-                mse = 0.0
-
-            # cylinder loss
-            if self.cylinder_loss:
-                position = th.zeros(
-                (1, 3), dtype=th.float32, device=self.model.device
-                )  # (B, 3)
-                # The direction of the cylinder is aligned along the z-axis
-                direction = th.zeros((1, 3), dtype=th.float32, device=self.model.device)
-                direction[:, 2] = 1.0  # Aligned along z-axis
-                pose_matrix = self.model.cTr_to_pose_matrix(
-                    cTr.unsqueeze(0)
-                ).squeeze()
-
-                radius = 0.0085 / 2  # adjust radius if needed
-                # proj_position_2d, cam_pts_3d_position = transform_points(position, pose_matrix, intr)
-                # proj_norm_2d, cam_pts_3d_norm = transform_points(direction, pose_matrix, intr)
-                cylinder_val = self.cylinder_loss_single(
-                    mask, position, direction, pose_matrix, radius
-                )
-            else:
-                cylinder_val = 0.0
-
-            # keypoint loss
-            if self.kpts_loss:
-                pose_matrix = self.model.cTr_to_pose_matrix(cTr.unsqueeze(0)).squeeze()
-
-                R_list, t_list = lndFK(joint_angles)
-                R_list = R_list.to(self.model.device)
-                t_list = t_list.to(self.model.device)
-                p_img1 = get_img_coords(
-                    self.p_local1,
-                    R_list[2],
-                    t_list[2],
-                    pose_matrix.to(joint_angles.dtype),
-                    self.intr,
-                )
-                p_img2 = get_img_coords(
-                    self.p_local2,
-                    R_list[3],
-                    t_list[3],
-                    pose_matrix.to(joint_angles.dtype),
-                    self.intr,
-                )
-                proj_keypoints = th.stack([p_img1, p_img2], dim=0)
-
-                pts_val = self.keypoint_chamfer_loss(proj_keypoints, ref_keypoints)
-            else:
-                pts_val = 0.0
-
-            loss = self.mse_weight * mse + self.pts_weight * pts_val + self.cylinder_weight * cylinder_val
-
-            loss.backward()
-
-            optimizer.step()
-
-        # Save the current cTr and joint angles for the next iteration
-        cTr = th.cat((axis, xyz), dim=0)  # concatenate axis and xyz to form cTr
-        self._prev_cTr = cTr.detach()
-        self._prev_joint_angles = joint_angles.detach()
-
-        if visualization:
-            # Render the predicted mask for visualization
-            robot_mesh = self.robot_renderer.get_robot_mesh(joint_angles)
-            rendered_mask = self.model.render_single_robot_mask(cTr, robot_mesh, self.robot_renderer).squeeze(0)
-
-            # Project keypoints
-            pose_matrix = self.model.cTr_to_pose_matrix(cTr.unsqueeze(0)).squeeze()
-            R_list, t_list = lndFK(joint_angles)
-            R_list = R_list.to(self.model.device)
-            t_list = t_list.to(self.model.device)
-            p_img1 = get_img_coords(
-                self.p_local1,
-                R_list[2],
-                t_list[2],
-                pose_matrix.to(joint_angles.dtype),
-                self.intr,
-            )
-            p_img2 = get_img_coords(
-                self.p_local2,
-                R_list[3],
-                t_list[3],
-                pose_matrix.to(joint_angles.dtype),
-                self.intr,
-            )
-            proj_keypoints = th.stack([p_img1, p_img2], dim=0)
-
-            # Project cylinders
-            cTr_batch = cTr.unsqueeze(0)  # shape (1, 6)
-            B = 1
-            position = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
-            direction = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
-            direction[:, 2] = 1.0
-            pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch).squeeze(0)  # shape(B, 4, 4)
-            radius = 0.0085 / 2
-            intr = self.intr
-            fx, fy, px, py = intr[0, 0].item(), intr[1, 1].item(), intr[0, 2].item(), intr[1, 2].item()
-
-            _, cam_pts_3d_position = transform_points(position, pose_matrix, intr)
-            _, cam_pts_3d_norm = transform_points(direction, pose_matrix, intr)
-            cam_pts_3d_norm = th.nn.functional.normalize(cam_pts_3d_norm)
-            e_1, e_2 = projectCylinderTorch(
-                cam_pts_3d_position, cam_pts_3d_norm, radius, fx, fy, px, py
-            )  # [B,2], [B,2]
-            projected_lines = torch.stack((e_1, e_2), dim=1)  # [B, 2, 2]
-
-            # Plot the overlay mask
-            overlay = self.overlay_mask(
-                mask.detach(), 
-                rendered_mask.detach(),
-                ref_pts=ref_keypoints,
-                proj_pts=proj_keypoints,
-                ref_lines=self.det_line_params.squeeze(),
-                proj_lines=projected_lines.squeeze()
-            )
-
-            return cTr.detach(), joint_angles.detach(), loss.item(), overlay
-        else:
-            return cTr.detach(), joint_angles.detach(), loss.item(), None
-
-
 class DummyLogger(Logger):
     """
     A dummy logger that only maintains the best solution during the optimization.
@@ -708,12 +302,6 @@ class PoseEstimationProblem(Problem):
         else:
             self.weighting_mask = torch.ones(shape, dtype=torch.float32).to(self.model.device)
 
-    def fine_search(self):
-        self.render_loss = True
-
-    def coarse_search(self):
-        self.render_loss = False
-
     def update_problem(
         self, ref_mask, ref_keypoints, det_line_params, joint_angles, stdev_init
     ):
@@ -783,17 +371,22 @@ class PoseEstimationProblem(Problem):
 
         return cylinder_loss
 
-    @torch.no_grad()
-    def _evaluate_batch(self, solutions: SolutionBatch):
-        values = solutions.values.clone() * self.lengthscales  # extract and scale the values by the lengthscales
-        cTr_batch = values[:, :6]  # shape (B, 6)
+    def compute_loss(self, raw_values):
+        values = raw_values * self.lengthscales # scale the values by the lengthscales
+
+        raw_cTr_batch = values[:, :6]  # shape (B, 6)
         joint_angles = values[:, 6:]  # shape (B, 4)
-        B = cTr_batch.shape[0]
+        B = raw_cTr_batch.shape[0]
 
         if self.use_mix_angle:
-            mix_angle_batch = cTr_batch[:, :3]  # shape (B, 3)
+            mix_angle_batch = raw_cTr_batch[:, :3]  # shape (B, 3)
             axis_angle_batch = mix_angle_to_axis_angle(mix_angle_batch)  # shape
-            cTr_batch[:, :3] = axis_angle_batch  # replace the first 3 elements with axis-angle
+            # cTr_batch[:, :3] = axis_angle_batch  # replace the first 3 elements with axis-angle
+            cTr_batch = torch.cat(
+                [axis_angle_batch, raw_cTr_batch[:, 3:]], dim=1
+            ) 
+        else:
+            cTr_batch = raw_cTr_batch
 
         if self.render_loss:
             # Obtain the weighting mask
@@ -851,14 +444,14 @@ class PoseEstimationProblem(Problem):
                 self.p_local1,
                 R_list[:,2,...],
                 t_list[:,2,...],
-                pose_matrix_b.squeeze().to(joint_angles.dtype),
+                pose_matrix_b.to(joint_angles.dtype),
                 self.intr,
             )
             p_img2 = get_img_coords_batch(
                 self.p_local2,
                 R_list[:,3,...],
                 t_list[:,3,...],
-                pose_matrix_b.squeeze().to(joint_angles.dtype),
+                pose_matrix_b.to(joint_angles.dtype),
                 self.intr,
             )
             # They are both B, 2
@@ -922,201 +515,87 @@ class PoseEstimationProblem(Problem):
             + self.cylinder_weight * cylinder_val
         )
 
-        solutions.set_evals(loss)
+        return loss
+
+    def _evaluate_batch(self, batch: SolutionBatch) -> SolutionBatch:
+        values = batch.values.clone()  # extract the values
+        losses = self.compute_loss(values)  # shape (B,)
+        batch.set_evals(losses)  # set the evaluations for the batch
 
 
-class SimplePoseEstimationProblem(PoseEstimationProblem):
-    """
-    Assuming the optimal joint angles are known, this problem only optimizes the 6D pose (cTr).
-    """
-    def __init__(
-        self, model, robot_renderer, ref_mask, intr, p_local1, p_local2, joint_angles=None
-    ):
-        super().__init__(model, robot_renderer, ref_mask, intr, p_local1, p_local2)
-
-        self.joint_angles = joint_angles
-
-    def update_problem(self, ref_mask, ref_keypoints, det_line_params, joint_angles, stdev_init):
-        """
-        Update the problem with the reference mask, keypoints, detected line parameters, and joint angles.
-        """
-        self.ref_mask = ref_mask
-        self.ref_keypoints = ref_keypoints
-        self.det_line_params = det_line_params
-        self.joint_angles = joint_angles
-
-        if self.weighting_mask is None:
-            self.compute_weighting_mask(shape=self.ref_mask.shape)
-
-        # Compute distance map
-        mask = 1 - self.ref_mask.float()  # Invert the mask for the distance transform
-        v, lamb, iterations = 1e10, 0.0, 2 # Use Euclidean distance transform only
-        self.dist_map = FastGeodis.generalised_geodesic2d(
-            self.weighting_mask.unsqueeze(0).unsqueeze(0),
-            mask.unsqueeze(0).unsqueeze(0),
-            v, 
-            lamb,
-            iterations
-        ).squeeze()
-
-        # Convert stdev_init to lengthscales
-        if torch.is_tensor(stdev_init):
-            self.lengthscales = stdev_init.clone().detach()
-        else:
-            self.lengthscales = stdev_init
-
-        # Update the DHT loss with the reference mask
-        if self.dht_loss:
-            mask = ref_mask.repeat(3, 1, 1).unsqueeze(0)
-            self.DHT_loss.update_heatmap(mask)
-
-        # Compute the robot mesh once and store it since the joint angles are fixed.
-        self.verts, self.faces = self.robot_renderer.get_robot_verts_and_faces(joint_angles)
-
-        # Get R and t lists for the fixed joint angles
-        R_list, t_list = lndFK(joint_angles)
-        self.R_list = R_list.to(self.model.device)  # [4, 3, 3]
-        self.t_list = t_list.to(self.model.device)  # [4, 3]
-
-    @torch.no_grad()
-    def _evaluate_batch(self, solutions: SolutionBatch):
-        values = solutions.values.clone() * self.lengthscales  # extract and scale the values by the lengthscales
-        cTr_batch = values[:, :6]  # shape (B, 6)
-        B = cTr_batch.shape[0]
-
-        if self.use_mix_angle:
-            # print("[Using Euler angles for optimization. Converting to axis-angle representation.]")
-            mix_angle_batch = cTr_batch[:, :3]  # shape (B, 3)
-            axis_angle_batch = mix_angle_to_axis_angle(mix_angle_batch)  # shape
-            cTr_batch[:, :3] = axis_angle_batch  # replace the first 3 elements with axis-angle
-
-        if self.render_loss:
-            # Obtain the weighting mask
-            weighting_mask = self.weighting_mask
-            weighting_mask = weighting_mask.unsqueeze(0).expand(
-                B, *[-1 for _ in weighting_mask.shape]
-            )
-
-            self.ref_mask_b = self.ref_mask.unsqueeze(0).expand(
-                B, self.ref_mask.shape[0], self.ref_mask.shape[1]
-            )
-            pred_masks_b = self.model.render_robot_mask_batch_nvdiffrast(
-                cTr_batch, self.verts, self.faces, self.robot_renderer
-            )  # shape (B,H,W)
-
-            mse = F.mse_loss(
-                pred_masks_b * weighting_mask,
-                self.ref_mask_b * weighting_mask,
-                reduction="none",
-            ).mean(dim=(1, 2))
-
-            # Compute distance loss
-            dist_map_ref = self.dist_map.unsqueeze(0).expand(
-                B, *[-1 for _ in self.dist_map.shape]
-            )  # [B, H, W]
-            dist = torch.sum(
-                (pred_masks_b * weighting_mask) * (dist_map_ref * weighting_mask), 
-                dim=(1, 2)
-            )
-
-            # Compute appearance loss
-            sum_pred = torch.sum(pred_masks_b, dim=(1, 2))  # [B]
-            sum_ref = torch.sum(self.ref_mask_b, dim=(1, 2))
-            app = torch.abs(sum_pred - sum_ref) 
-
-        else:
-            mse, dist, app = 0.0, 0.0, 0.0
-
-        if self.kpts_loss:
-            pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch)  # [B, 4, 4]
-
-            R_list, t_list = self.R_list, self.t_list
-            
-            p_img1 = get_img_coords_batch(
-                self.p_local1,
-                R_list[2],
-                t_list[2],
-                pose_matrix_b.squeeze().to(self.joint_angles.dtype),
-                self.intr,
-            )
-            p_img2 = get_img_coords_batch(
-                self.p_local2,
-                R_list[3],
-                t_list[3],
-                pose_matrix_b.squeeze().to(self.joint_angles.dtype),
-                self.intr,
-            )
-            # They are both B, 2
-
-            proj_pts = torch.stack((p_img1, p_img2), dim=1)  # [B, 2, 2]
-
-            ref_kps_2d = self.ref_keypoints.unsqueeze(0).expand(B, -1, -1)  
-            pts_val = keypoint_loss_batch(proj_pts, ref_kps_2d)  # [B]
-
-        else:
-            pts_val = 0.0
-
-        if self.cylinder_loss:
-            position = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
-            direction = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
-            direction[:, 2] = 1.0
-            pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch).squeeze(0)  # shape(B, 4, 4)
-            radius = 0.0085 / 2
-
-            # We'll do a small custom function "cylinder_loss_single" that returns (loss, angle).
-            cylinder_val = self.cylinder_loss_batch(
-                position,
-                direction,
-                pose_matrix_b,
-                radius,
-            )  
-
-        elif self.dht_loss:
-            position = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
-            direction = torch.zeros((B, 3), dtype=torch.float32, device=self.model.device)  # (B, 3)
-            direction[:, 2] = 1.0
-            pose_matrix_b = self.model.cTr_to_pose_matrix(cTr_batch).squeeze(0)  # shape(B, 4, 4)
-            radius = 0.0085 / 2
-
-            # get the projected cylinder lines parameters
-            ref_mask = self.ref_mask
-            intr = self.intr
-
-            _, cam_pts_3d_position = transform_points_b(position, pose_matrix_b, intr)
-            _, cam_pts_3d_norm = transform_points_b(direction, pose_matrix_b, intr)
-            cam_pts_3d_norm = torch.nn.functional.normalize(
-                cam_pts_3d_norm
-            )  # NORMALIZE !!!!!!
-
-            # print(f"checking shape of cylinder input: {cam_pts_3d_position.shape, cam_pts_3d_norm.shape}")  both [B,3]
-            e_1, e_2 = projectCylinderTorch(
-                cam_pts_3d_position, cam_pts_3d_norm, radius, self.fx, self.fy, self.px, self.py
-            )  # [B,2], [B,2]
-            projected_lines = torch.stack((e_1, e_2), dim=1)  # [B, 2, 2]
-            
-            cylinder_val = self.DHT_loss(projected_lines) # maximize in the heatmap
-
-        else:
-            cylinder_val = 0.0
-
-        loss = (
-            self.mse_weight * mse
-            + self.dist_weight * dist
-            + self.app_weight * app
-            + self.pts_weight * pts_val 
-            + self.cylinder_weight * cylinder_val
+class GradientDescentSearcher(SearchAlgorithm):
+    def __init__(self, problem: Problem, stdev_init=1., center_init=None):
+        SearchAlgorithm.__init__(
+            self,
+            problem=problem, 
+            pop_best=self._get_pop_best,
+            pop_best_eval=self._get_pop_best_eval
         )
 
-        solutions.set_evals(loss)
+        # Turn on antialiasing if using NvDiffRast renderer
+        if self.problem.model.args.use_nvdiffrast and not self.problem.model.use_antialiasing:
+            print("[Antialiasing is not enabled in the NvDiffRast renderer. This may lead to inaccurate gradients.]")
+            print("[Enabling antialiasing for better gradients.]")
+            self.problem.model.use_antialiasing = True # use antialiasing for better gradients
+
+        # Initialize the variables and optimizer
+        self.vars = center_init.clone().unsqueeze(0).requires_grad_(True)
+        self.optimizer = torch.optim.Adam([self.vars], lr=1.)
+
+        # Dummy data for the logger to process
+        self.batch = self.problem.generate_batch(1)
+        self._pop_best: Optional[Solution] = None
+
+    def _get_pop_best(self):
+        return self._pop_best
+
+    def _get_pop_best_eval(self):
+        return self._pop_best.evals[0].item()
+
+    def _step(self):
+        # Back-propagate the loss
+        self.optimizer.zero_grad()
+
+        loss = self.problem.compute_loss(self.vars).squeeze()
+
+        loss.backward()
+
+        self.optimizer.step()
+
+        # Update dummy data
+        self.batch.set_values(self.vars.detach().clone())
+        self.batch.set_evals(loss.unsqueeze(0).detach().clone())
+        self._pop_best = self.batch[0]
 
 
-class EvoTracker(Tracker):
+class NelderMeadSearcher(SearchAlgorithm):
+    pass
+
+
+class RandomSearcher(SearchAlgorithm):
+    pass
+
+
+class Tracker:
     def __init__(
         self, model, robot_renderer, init_cTr, init_joint_angles, 
         num_iters=5, intr=None, p_local1=None, p_local2=None, 
-        stdev_init=5e-3, use_CMAES=True, optimize_joint_angles=True
+        stdev_init=1., searcher="CMA-ES", optimize_joint_angles=True
     ):
-        super().__init__(model, robot_renderer, init_cTr, init_joint_angles, num_iters, intr, p_local1, p_local2)
+        self.model = model
+        self.robot_renderer = robot_renderer
+
+        self._prev_cTr = init_cTr
+        self._prev_joint_angles = init_joint_angles
+        self.num_iters = num_iters
+
+        self.num_iters = num_iters # number of iterations for optimization
+
+        self.intr = intr  
+        self.p_local1 = p_local1  
+        self.p_local2 = p_local2 
+
+        self.fx, self.fy, self.px, self.py = intr[0, 0].item(), intr[1, 1].item(), intr[0, 2].item(), intr[1, 2].item()
 
         self.stdev_init = stdev_init  # Initial standard deviation for the optimization
 
@@ -1125,13 +604,24 @@ class EvoTracker(Tracker):
             self.model.args.use_nvdiffrast = True  # use NvDiffRast renderer
             self.model.use_antialiasing = False # do not use antialiasing as gradients are not needed
 
-        if optimize_joint_angles:
-            self.problem = PoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init)
-        else:
-            self.stdev_init = self.stdev_init[:6] if isinstance(self.stdev_init, torch.Tensor) else self.stdev_init
-            self.problem = SimplePoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init)  # Problem will be set in track method
+        # if optimize_joint_angles:
+        #     self.problem = PoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init)
+        # else:
+        #     self.stdev_init = self.stdev_init[:6] if isinstance(self.stdev_init, torch.Tensor) else self.stdev_init
+        #     self.problem = SimplePoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init)  # Problem will be set in track method
 
-        self.optimizer = CMAES_cus if use_CMAES else XNES
+        assert optimize_joint_angles, "Currently only optimizing joint angles is supported."
+        self.problem = PoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init)
+
+        optimizer_dict = {
+            "CMA-ES": CMAES_cus, # customized CMA-ES implementation
+            "XNES": XNES,
+            "SNES": SNES,
+            "Gradient": GradientDescentSearcher,
+            "Nelder-Mead": NelderMeadSearcher,
+            "RandomSearch": RandomSearcher,
+        }
+        self.optimizer = optimizer_dict[searcher]
 
         # Transform the intial cTr to Euler angle if required
         self.use_mix_angle = USE_MIX_ANGLE  
@@ -1143,14 +633,97 @@ class EvoTracker(Tracker):
         else:
             print("[Using axis-angle space for optimization.]")
 
-    @torch.no_grad()
+    def overlay_mask(self, ref_mask, pred_mask, ref_pts=None, proj_pts=None, ref_lines=None, proj_lines=None):
+        """
+        Overlay the predicted mask on the reference mask for visualization.
+        """
+        # Convert masks to grayscale images
+        ref_mask = ref_mask.float().cpu().numpy()
+        pred_mask = pred_mask.float().cpu().numpy()
+        # ref_mask = (ref_mask*255).astype(np.uint8)
+        # pred_mask = (pred_mask*255).astype(np.uint8)
+
+        w, h = ref_mask.shape[1], ref_mask.shape[0]
+        
+        # Create a color overlay
+        # rendered_color = np.stack([0.5 * pred_mask, 0.8 * pred_mask, np.zeros_like(pred_mask)], axis=-1) # Light blue for rendered mask
+        # ref_color = np.stack([ref_mask, 0.6 * ref_mask, 0.1 * ref_mask], axis=-1)  # Orange for reference mask
+        # overlay = rendered_color * 0.5 + ref_color * 0.5
+        # # overlay = np.clip(overlay, 0, 1)
+        # overlay = (overlay * 255).astype(np.uint8)
+        # overlay = np.clip(overlay, 0, 255)
+        overlay = np.zeros((h, w, 3), dtype=np.uint8)  # Create an empty overlay image
+        overlay[..., 0] = (ref_mask * 255).astype(np.uint8)  # Blue channel 
+        overlay[..., 2] = (pred_mask * 255).astype(np.uint8)  # Green channel
+
+        if ref_pts != None:
+            center_ref_pt = th.mean(ref_pts, dim=0)
+            for ref_pt in ref_pts:
+                u_ref, v_ref = int(ref_pt[0]), int(ref_pt[1])
+                cv2.circle(
+                    overlay,
+                    (u_ref, v_ref),
+                    radius=5,
+                    color=(255, 0.6 * 255, 0.1 * 255),
+                    thickness=-1,
+                )  # Green
+
+            u_ref, v_ref = int(center_ref_pt[0]), int(center_ref_pt[1])
+            cv2.circle(
+                overlay,
+                (u_ref, v_ref),
+                radius=5,
+                color=(255, 0.6 * 255, 0.1 * 255),
+                thickness=-1,
+            )  # Green  BGR
+            # Draw projected keypoints in red
+
+        if proj_pts is not None:
+            center_proj_pt = th.mean(proj_pts, dim=0)
+            for proj_pt in proj_pts.squeeze():
+                # print(f"debugging the project pts {proj_pts}")
+                u_proj, v_proj = int(proj_pt[0].item()), int(proj_pt[1].item())
+                cv2.circle(
+                    overlay, (u_proj, v_proj), radius=5, color=(255*0.1, 255*0.6, 255), thickness=-1
+                )  # Red
+
+            u_ref, v_ref = int(center_proj_pt[0]), int(center_proj_pt[1])
+            cv2.circle(
+                overlay, (u_ref, v_ref), radius=5, color=(255*0.1, 255*0.6, 255), thickness=-1
+            )  # Green
+
+        # Draw detected lines in blue (convert from line parameters to endpoints)
+        if ref_lines is not None:
+            for line_params in ref_lines:
+                a, b = line_params
+                (x1, y1), (x2, y2) = convert_line_params_to_endpoints(a.item(), b.item(), w, h)
+                cv2.line(
+                    overlay,
+                    (x1, y1),
+                    (x2, y2),
+                    (255, 0.6 * 255, 0.1 * 255),
+                    thickness=2,
+                ) 
+
+        # Draw projected lines in cyan (convert from line parameters to endpoints)
+        if proj_lines is not None:
+            for line_params in proj_lines:
+                a, b = line_params
+                (x1, y1), (x2, y2) = convert_line_params_to_endpoints(a, b, w, h)
+                cv2.line(
+                    overlay, (x1, y1), (x2, y2), (255*0.1, 255*0.6, 255), thickness=2
+                ) 
+
+
+        return overlay
+
     def track(self, mask, joint_angles, ref_keypoints, det_line_params, visualization=False):
         # Update the optimization problem
         ref_mask = mask.to(self.model.device)
         self.problem.update_problem(
             ref_mask, ref_keypoints, det_line_params, joint_angles, self.stdev_init
         )
-        
+            
         # Initialize the solution with the previous cTr and joint angles
         cTr = self._prev_cTr.clone()
 
@@ -1161,17 +734,8 @@ class EvoTracker(Tracker):
         searcher = self.optimizer(
             problem=self.problem,
             stdev_init=1.,
-            c_m=2.,
-            # c_sigma_ratio=2.,
-            # damp_sigma_ratio=2.,
-            # c_c_ratio=0.5,
-            # c_1_ratio=2.,
-            c_mu_ratio=2.,
             center_init=center_init / self.problem.lengthscales,
-            popsize=70,
-            # mu_size=20 # only when using CMAES_cus
         )
-        searcher.mu = 10
         logger = DummyLogger(searcher, interval=1, after_first_step=False)
         # logger2 = StdOutLogger(searcher, interval=1, after_first_step=False)
 

@@ -92,6 +92,26 @@ def generate_low_discrepancy_normal(num_samples, dim, ratio=0.3):
     return torch.cat((ld_samples, normal_samples), dim=0)
 
 
+def generate_sigma_normal(num_samples, dim):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    assert num_samples >= 2 * dim + 1, "Number of samples must be at least 2 * dim + 1 for sigma sampling."
+
+    # Generate 2 * dim canonical sigma points excluding the mean
+    c = torch.sqrt(torch.tensor(float(dim), device=device))
+    zero = torch.zeros(dim, device=device)
+    eye = torch.eye(dim, device=device)
+    sigma_points = torch.stack([
+        c * eye,  # positive directions
+        -c * eye  # negative directions
+    ], dim=0).view(-1, dim)  # shape (2*dim + 1, dim)
+
+    # Generate normal samples
+    normal_samples = generate_qmc_normal(num_samples - 2 * dim, dim).cuda()
+
+    return torch.cat((sigma_points, normal_samples), dim=0)
+
+
+
 class CMAES_cus(CMAES):
     """
     CMA-ES algorithm for optimization.
@@ -102,10 +122,10 @@ class CMAES_cus(CMAES):
         self,
         problem: Problem,
         *,
-        stdev_init: Real,
-        popsize: Optional[int] = None,
+        stdev_init: Real = 1.0,
+        popsize: Optional[int] = 70, # NOTE. Modified to 70
         center_init: Optional[Vector] = None,
-        c_m: Real = 1.0,
+        c_m: Real = 2.0, # NOTE. Modified to 2.0
         c_sigma: Optional[Real] = None,
         c_sigma_ratio: Real = 1.0,
         damp_sigma: Optional[Real] = None,
@@ -115,7 +135,7 @@ class CMAES_cus(CMAES):
         c_1: Optional[Real] = None,
         c_1_ratio: Real = 1.0,
         c_mu: Optional[Real] = None,
-        c_mu_ratio: Real = 1.0,
+        c_mu_ratio: Real = 2.0, # NOTE. Modified to 2.0
         active: bool = True,
         csa_squared: bool = False,
         stdev_min: Optional[Real] = None,
@@ -123,7 +143,7 @@ class CMAES_cus(CMAES):
         separable: bool = False,
         limit_C_decomposition: bool = True,
         obj_index: Optional[int] = None,
-        mu_size: Optional[int] = None
+        mu_size: Optional[int] = 10 # NOTE. Modified to 10
     ):
         """
         `__init__(...)`: Initialize the CMAES solver.
@@ -223,7 +243,7 @@ class CMAES_cus(CMAES):
             popsize = 4 + int(np.floor(3 * np.log(d)))
         self.popsize = int(popsize)
         # Half popsize, referred to as mu in CMA-ES literature
-        self.mu = int(np.floor(popsize / 2)) if mu_size is None else mu_size
+        self.mu = int(np.floor(popsize / 2)) 
         self._population = problem.generate_batch(popsize=popsize)
 
         # === Initialize search distribution ===
@@ -379,6 +399,8 @@ class CMAES_cus(CMAES):
         # Use the SinglePopulationAlgorithmMixin to enable additional status reports regarding the population.
         SinglePopulationAlgorithmMixin.__init__(self)
 
+        self.mu = mu_size  # Set the mu size for CMA-ES
+
     def update_mu_size(
         self,
         c_m: Real = 1.0,
@@ -503,15 +525,18 @@ class CMAES_cus(CMAES):
         if num_samples is None:
             num_samples = self.popsize
 
-        # Generate z values (num_samples, d)
+        # # Generate z values (num_samples, d)
         # zs = self._problem.make_gaussian(num_solutions=num_samples)
         # zs = generate_qmc_normal(num_samples=num_samples, dim=self._problem.solution_length).to(self._problem.device)
 
-        # Generate student-t instead of standard normal
+        # # Generate student-t instead of standard normal
         # zs = generate_student_t_distribution(num_samples=num_samples, dim=self._problem.solution_length, v=5.0).to(self._problem.device)
 
-        # Generate low-discrepancy normal samples
-        zs = generate_low_discrepancy_normal(num_samples=num_samples, dim=self._problem.solution_length)
+        # # Generate low-discrepancy normal samples
+        # zs = generate_low_discrepancy_normal(num_samples=num_samples, dim=self._problem.solution_length)
+
+        # Generate sigma points
+        zs = generate_sigma_normal(num_samples=num_samples, dim=self._problem.solution_length)
 
         # Construct ys = A zs
         if self.separable:

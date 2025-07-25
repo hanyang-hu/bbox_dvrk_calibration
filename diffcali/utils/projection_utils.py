@@ -22,8 +22,8 @@ def get_img_coords_batch(p_local, R, t, cTr_matrix, intr):
     """
     Transforms a batch of local points in the mesh frame to image coordinates.
     """
-    
     B = cTr_matrix.shape[0]
+    
     p_local = p_local.unsqueeze(0).expand(B, *[-1 for _ in p_local.shape])   # [B, 3]
     if len(R.shape) < 3:
         R = R.unsqueeze(0).expand(B, *[-1 for _ in R.shape])        # [B, 3, 3]

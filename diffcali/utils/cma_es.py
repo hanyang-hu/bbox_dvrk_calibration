@@ -94,7 +94,10 @@ def generate_low_discrepancy_normal(num_samples, dim, ratio=0.3):
 
 def generate_sigma_normal(num_samples, dim):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    assert num_samples >= 2 * dim + 1, "Number of samples must be at least 2 * dim + 1 for sigma sampling."
+    # assert num_samples >= 2 * dim + 1, "Number of samples must be at least 2 * dim + 1 for sigma sampling."
+    
+    if num_samples < 2 * dim + 1:
+        return generate_qmc_normal(num_samples, dim).cuda()
 
     # Generate 2 * dim canonical sigma points excluding the mean
     c = torch.sqrt(torch.tensor(float(dim), device=device))
@@ -123,7 +126,7 @@ class CMAES_cus(CMAES):
         problem: Problem,
         *,
         stdev_init: Real = 1.0,
-        popsize: Optional[int] = 70, # NOTE. Modified to 70
+        popsize: Optional[int] = None, 
         center_init: Optional[Vector] = None,
         c_m: Real = 2.0, # NOTE. Modified to 2.0
         c_sigma: Optional[Real] = None,

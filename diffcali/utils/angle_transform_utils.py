@@ -14,14 +14,24 @@ def enforce_quaternion_consistency(quaternions: torch.Tensor) -> torch.Tensor:
 
     # Compute the sign consistency based on the first quaternion's vector part
     temp = quaternions[0, 1:].unsqueeze(0)  # Use the first quaternion's vector part for sign consistency
-    signs = torch.sign((temp * quaternions[1:,1:]).sum(dim=-1)).squeeze()  # Compute dot product to determine sign consistency
-    signs = torch.cat([torch.tensor([1.0], device=quaternions.device), signs])
-    signs = signs.unsqueeze(1).to(quaternions.device)  # Reshape to (B, 1) for broadcasting
+    # signs = torch.sign((temp * quaternions[1:,1:]).sum(dim=-1)).squeeze()  # Compute dot product to determine sign consistency
+    # signs = torch.cat([torch.tensor([1.0], device=quaternions.device), signs])
+    # signs = signs.unsqueeze(1).to(quaternions.device)  # Reshape to (B, 1) for broadcasting
 
-    # Apply the signs to the quaternions
-    quaternions = quaternions * signs
+    signs = torch.sign((temp * quaternions[:,1:]).sum(dim=-1)).unsqueeze(-1)
 
-    return quaternions
+    return quaternions * signs
+
+
+# @torch.compile()
+def enforce_axis_angle_consistency(axis_angles: torch.Tensor) -> torch.Tensor:
+    if axis_angles.ndim != 2 or axis_angles.shape[1] != 3:
+        raise ValueError("Input axis angles must have shape (B, 3)")
+
+    temp = axis_angles[0,:].unsqueeze(0)
+    signs = torch.sign((temp * axis_angles).sum(dim=-1)).unsqueeze(-1)
+
+    return axis_angles * signs
 
 
 @torch.compile()
@@ -141,6 +151,7 @@ def unscented_mix_angle_to_axis_angle(mix_angle: torch.Tensor, stdev: torch.Tens
 
     # Transform sigma points to axis-angle
     sigma_transformed = mix_angle_to_axis_angle(sigma_points) # (7, 3)
+    sigma_transformed = enforce_axis_angle_consistency(sigma_transformed)
 
     # Weights for UT (symmetric)
     Wm = torch.full((2 * D + 1,), 1.0 / (2 * D), device=mix_angle.device)

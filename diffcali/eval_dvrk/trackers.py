@@ -19,9 +19,14 @@ from diffcali.utils.detection_utils import detect_lines
 from diffcali.utils.dht_utils import DeepCylinderLoss, SmoothDeepCylinderLoss
 from diffcali.utils.angle_transform_utils import (
     mix_angle_to_axis_angle,
-    axis_angle_to_mix_angle
+    axis_angle_to_mix_angle,
+    unscented_mix_angle_to_axis_angle,
 )
-from diffcali.utils.cma_es import CMAES_cus
+from diffcali.utils.cma_es import (
+    CMAES_cus, 
+    generate_sigma_normal,
+    generate_low_discrepancy_normal,
+)
 
 from evotorch import Problem, SolutionBatch
 from evotorch.algorithms import SearchAlgorithm, SNES, XNES, CMAES
@@ -31,22 +36,25 @@ from evotorch.logging import Logger, StdOutLogger
 torch.set_default_dtype(torch.float32)
 
 
-# Loss settings
-USE_RENDER_LOSS = True
-USE_PTS_LOSS = True  # whether to use keypoint loss
-USE_CYD_LOSS = False # whether to use cylinder loss
-USE_DHT_LOSS = False and not USE_CYD_LOSS # whether to use DHT loss (if cylinder loss is not used)
+# # Loss settings
+# self.args.use_render_loss = True
+# self.args.use_pts_loss = True  # whether to use keypoint loss
+# self.args.use_cyd_loss = False # whether to use cylinder loss
+# self.args.use_dht_loss = False and not self.args.use_cyd_loss # whether to use DHT loss (if cylinder loss is not used)
 
-MSE_WEIGHT = 6.  # weight for the MSE loss
-DIST_WEIGHT = 12e-7 # weight for the distance loss (based on Euclidean distance transform)
-APP_WEIGHT = 6e-6 # 
-PTS_WEIGHT = 5e-3  # weight for the keypoint loss
-CYD_WEIGHT = 1e-2 if USE_DHT_LOSS else 1e-2 # weight for the cylinder loss
+# self.args.mse_weight = 6.  # weight for the MSE loss
+# self.args.dist_weight = 12e-7 # weight for the distance loss (based on Euclidean distance transform)
+# self.args.app_weight = 6e-6 # 
+# self.args.pts_weight = 5e-3  # weight for the keypoint loss
+# self.args.cyd_weight = 1e-2 if self.args.use_dht_loss else 1e-2 # weight for the cylinder loss
+
+# self.args.popsize = 70  # Population size for the search algorithm
 
 
-# Objective Setting
-USE_MIX_ANGLE = True
-USE_WEIGHTING_MASK = False
+# # Objective Setting
+# self.args.use_mix_angle = False
+# self.args.use_unscented_transform = True and not self.args.use_mix_angle
+# self.args.use_weighting_mask = False
 
 
 def convert_line_params_to_endpoints(a, b, image_width, image_height):
@@ -231,7 +239,7 @@ class DummyLogger(Logger):
 
 class PoseEstimationProblem(Problem):
     def __init__(
-        self, model, robot_renderer, ref_mask, intr, p_local1, p_local2, stdev_init
+        self, model, robot_renderer, ref_mask, intr, p_local1, p_local2, stdev_init, args
     ):
         super().__init__(
             objective_sense="min",
@@ -256,18 +264,18 @@ class PoseEstimationProblem(Problem):
         self.ref_keypoints = None
         self.det_line_params = None
 
-        self.render_loss = USE_RENDER_LOSS
-        self.kpts_loss = USE_PTS_LOSS
-        self.cylinder_loss = USE_CYD_LOSS
-        self.dht_loss = USE_DHT_LOSS
+        self.args = args
 
-        self.mse_weight = MSE_WEIGHT  # weight for the MSE loss
-        self.dist_weight = DIST_WEIGHT  # weight for the distance loss
-        self.app_weight = APP_WEIGHT  # weight for the appearance loss
-        self.pts_weight = PTS_WEIGHT  # weight for the keypoint loss
-        self.cylinder_weight = CYD_WEIGHT  # weight for the cylinder loss
+        self.render_loss = self.args.use_render_loss
+        self.kpts_loss = self.args.use_pts_loss
+        self.cylinder_loss = self.args.use_cyd_loss
+        self.dht_loss = self.args.use_dht_loss
 
-        self.use_mix_angle = USE_MIX_ANGLE
+        self.mse_weight = self.args.mse_weight  # weight for the MSE loss
+        self.dist_weight = self.args.dist_weight  # weight for the distance loss
+        self.app_weight = self.args.app_weight  # weight for the appearance loss
+        self.pts_weight = self.args.pts_weight  # weight for the keypoint loss
+        self.cylinder_weight = self.args.cyd_weight  # weight for the cylinder loss
 
         # Convert stdev_init to lengthscales
         if torch.is_tensor(stdev_init):
@@ -287,7 +295,7 @@ class PoseEstimationProblem(Problem):
         Copied from your single-sample code: creates a weighting mask for the MSE.
         shape: (H,W)
         """
-        if USE_WEIGHTING_MASK:
+        if self.args.use_weighting_mask:
             h, w = shape
             y, x = np.ogrid[:h, :w]
             center_y, center_x = h / 2, w / 2
@@ -303,7 +311,7 @@ class PoseEstimationProblem(Problem):
             self.weighting_mask = torch.ones(shape, dtype=torch.float32).to(self.model.device)
 
     def update_problem(
-        self, ref_mask, ref_keypoints, det_line_params, joint_angles, stdev_init
+        self, ref_mask, ref_keypoints, det_line_params, joint_angles, cTr_init, stdev_init
     ):
         self.ref_mask = ref_mask
         self.ref_keypoints = ref_keypoints
@@ -339,6 +347,26 @@ class PoseEstimationProblem(Problem):
         # import matplotlib.pyplot as plt
         # plt.imshow(self.dist_map.cpu().numpy())
         # plt.show()
+
+        # Transform the initial rotation representations
+        self.cTr_init = cTr_init
+
+        if self.args.use_mix_angle:
+            axis_angle = cTr_init[:3].unsqueeze(0)  # shape (1, 3)
+            mix_angle = axis_angle_to_mix_angle(axis_angle)  # Convert to Euler angles
+            self.cTr_init[:3] = mix_angle.squeeze(0)  # Replace the first 3 elements with Euler angles
+
+        elif self.args.use_unscented_transform:
+            # Use unscented transform to obtain the Gaussian distribution in axis-angle space
+            axis_angle = cTr_init[:3].unsqueeze(0)  # shape (1, 3)
+            mix_angle = axis_angle_to_mix_angle(axis_angle).squeeze()  # Convert to Euler angles
+            mean_aa, cov_aa = unscented_mix_angle_to_axis_angle(mix_angle, stdev_init[:3])
+
+            # Determine the new orthogonal basis and lengthscale by eigenvalue decomposition
+            L, Q = torch.linalg.eigh(cov_aa)
+            self.cTr_init[:3] = mean_aa @ Q # transform the mean to the new basis
+            self.lengthscales[:3] = torch.sqrt(torch.clamp(L, min=1e-9)) # avoid numerical instability
+            self.Q = Q
 
     def cylinder_loss_batch(
         self, position, direction, pose_matrix, radius
@@ -378,13 +406,21 @@ class PoseEstimationProblem(Problem):
         joint_angles = values[:, 6:]  # shape (B, 4)
         B = raw_cTr_batch.shape[0]
 
-        if self.use_mix_angle:
+        if self.args.use_mix_angle:
             mix_angle_batch = raw_cTr_batch[:, :3]  # shape (B, 3)
             axis_angle_batch = mix_angle_to_axis_angle(mix_angle_batch)  # shape
             # cTr_batch[:, :3] = axis_angle_batch  # replace the first 3 elements with axis-angle
             cTr_batch = torch.cat(
                 [axis_angle_batch, raw_cTr_batch[:, 3:]], dim=1
             ) 
+
+        elif self.args.use_unscented_transform:
+            transformed_angle_batch = raw_cTr_batch[:, :3]
+            axis_angle_batch = transformed_angle_batch @ self.Q.T # transform back to the standard basis
+            cTr_batch = torch.cat(
+                [axis_angle_batch, raw_cTr_batch[:, 3:]], dim=1
+            ) 
+
         else:
             cTr_batch = raw_cTr_batch
 
@@ -524,7 +560,7 @@ class PoseEstimationProblem(Problem):
 
 
 class GradientDescentSearcher(SearchAlgorithm):
-    def __init__(self, problem: Problem, stdev_init=1., center_init=None):
+    def __init__(self, problem: Problem, stdev_init=1., center_init=None, popsize=None):
         SearchAlgorithm.__init__(
             self,
             problem=problem, 
@@ -537,6 +573,14 @@ class GradientDescentSearcher(SearchAlgorithm):
             print("[Antialiasing is not enabled in the NvDiffRast renderer. This may lead to inaccurate gradients.]")
             print("[Enabling antialiasing for better gradients.]")
             self.problem.model.use_antialiasing = True # use antialiasing for better gradients
+
+        # # Update center init by random sampling
+        # with torch.no_grad():
+        #     dim = self.problem.solution_length
+        #     candidates = generate_sigma_normal(popsize, dim) + center_init.unsqueeze(0) # shape (popsize, dim)
+        #     losses = self.problem.compute_loss(candidates)  # shape (popsize,)
+        #     idx = torch.argmin(losses).item() # Get the index of the best solution
+        #     center_init = candidates[idx]  # shape (dim,)
 
         # Initialize the variables and optimizer
         self.vars = center_init.clone().unsqueeze(0).requires_grad_(True)
@@ -569,18 +613,244 @@ class GradientDescentSearcher(SearchAlgorithm):
 
 
 class NelderMeadSearcher(SearchAlgorithm):
-    pass
+    def __init__(
+        self,
+        problem: Problem,
+        stdev_init: float = 1.0,
+        center_init: torch.Tensor = None,
+        popsize=None,
+        *,
+        alpha: float = 1.0,
+        gamma: float = 2.0,
+        rho: float = 0.5,
+        sigma: float = 0.5,
+    ):
+        # Initialize base SearchAlgorithm with status getters
+        SearchAlgorithm.__init__(
+            self,
+            problem=problem,
+            pop_best=self._get_pop_best,
+            pop_best_eval=self._get_pop_best_eval,
+        )
+        # Store Nelder-Mead coefficients
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+        self.rho = float(rho)
+        self.sigma = float(sigma)
+
+        # Determine dimension from center_init
+        if center_init is None:
+            raise ValueError("center_init must be provided for Nelder-Mead search.")
+        dim = center_init.shape[0]
+
+        # # Initialize and evaluate simplex
+        # simplex = center_init.clone().unsqueeze(0).repeat(dim+1, 1).cuda()
+        # for i in range(dim):
+        #     simplex[i+1, i] += 1. # Add offsets along each axis to form the simplex vertices
+        # losses = self.problem.compute_loss(simplex)
+        candidates = generate_sigma_normal(popsize, dim) + center_init.unsqueeze(0)
+        losses = self.problem.compute_loss(candidates)  # shape (popsize,)
+        _, indices = torch.topk(losses, k=dim + 1, largest=False)  # Get the indices of the best dim+1 solutions
+        simplex = candidates[indices]  # shape (dim + 1, dim)
+        losses = losses[indices]  # shape (dim + 1,)
+
+        # Track best solution so far
+        self.simplex = self.problem.generate_batch(dim + 1)
+        self.simplex.set_values(simplex)
+        self.simplex.set_evals(losses)
+        self._pop_best: Optional[Solution] = None
+
+    def _get_pop_best(self):
+        return self._pop_best
+
+    def _get_pop_best_eval(self):
+        return self._pop_best.evals[0].item()
+
+    def _step(self):
+        values = self.simplex.values.clone()  # shape (dim + 1, dim)
+        losses = self.simplex.evals.clone().squeeze() # shape (dim + 1,)
+        dim = values.shape[1]
+
+        # Extract best, worst, and centroid of the simplex
+        best_idx, worst_idx = torch.argmin(losses).item(), torch.argmax(losses).item()
+        masked_losses = losses.clone()
+        masked_losses[worst_idx] = -float("inf")  # exclude the worst
+        second_worst_idx = torch.argmax(masked_losses).item()
+        mask_worst = torch.ones(values.shape[0], dtype=bool, device=values.device)
+        mask_worst[worst_idx] = False
+
+        x_best = values[best_idx]
+        x_worst = values[worst_idx]
+        
+        mask_worst = torch.ones(values.shape[0], dtype=bool, device=values.device)
+        mask_worst[worst_idx] = False
+        centroid =values[mask_worst].mean(dim=0)
+
+        # Compute reflection, expansion, contraction and shrink
+        x_reflect = centroid + self.alpha * (centroid - x_worst)
+        x_exp = centroid + self.gamma * (x_reflect - centroid)
+        x_cont_outside = centroid + self.rho * (x_reflect - centroid)  # contraction outside
+        x_cont_inside = centroid + self.rho * (x_worst - centroid) # contraction inside
+        simplex_shrink = values + self.sigma * (x_best - values) # shrink the simplex towards the best solution
+
+        # Evaluate losses for reflection, expansion, contractiono and shrink at once
+        x_cat = torch.cat(
+            [x_reflect.unsqueeze(0), x_exp.unsqueeze(0), x_cont_outside.unsqueeze(0), x_cont_inside.unsqueeze(0), simplex_shrink], 
+            dim=0
+        )
+        new_losses = self.problem.compute_loss(x_cat)  # shape (dim + 5,)
+
+        # Assign the losses to the corresponding solutions
+        loss_reflect = new_losses[0]
+        loss_exp = new_losses[1]
+        loss_cont_outside = new_losses[2]
+        loss_cont_inside = new_losses[3]
+        loss_shrink = new_losses[4:]
+
+        shrink_needed = False
+
+        if loss_reflect < losses[second_worst_idx]:
+            if loss_reflect >= losses[best_idx]:
+                new_point = x_reflect
+                new_loss = loss_reflect
+            else:
+                if loss_exp < loss_reflect:
+                    new_point = x_exp
+                    new_loss = loss_exp
+                else:
+                    new_point = x_reflect
+                    new_loss = loss_reflect
+            values[worst_idx] = new_point
+            losses[worst_idx] = new_loss
+
+        else:
+            if loss_reflect < losses[worst_idx]:
+                if loss_cont_outside < loss_reflect:
+                    values[worst_idx] = x_cont_outside
+                    losses[worst_idx] = loss_cont_outside
+                else:
+                    shrink_needed = True
+            else:
+                if loss_cont_inside < losses[worst_idx]:
+                    values[worst_idx] = x_cont_inside
+                    losses[worst_idx] = loss_cont_inside
+                else:
+                    shrink_needed = True
+
+        if shrink_needed:
+            values = simplex_shrink
+            losses = loss_shrink
+
+        self.simplex.set_values(values.clone())
+        self.simplex.set_evals(losses.clone())
+
+        best_idx = torch.argmin(losses).item()
+        self._pop_best = self.simplex[best_idx]
+
+        # # Combine with the current simplex and determine the top dim+1 solutions
+        # all_values = torch.cat([values, x_cat], dim=0)  # shape (2*dim + 6, dim)
+        # all_losses = torch.cat([losses, new_losses], dim=0)  # shape (2*dim + 6,)
+        # # sorted_indices = torch.argsort(all_losses)  # sort by losses
+        # # updated_simplex_values = all_values[sorted_indices][:dim + 1]  # take the top dim+1 solutions
+        # # updated_losses = all_losses[sorted_indices][:dim + 1]  # take the top dim+1 losses
+        # updated_losses, sorted_indices = torch.topk(all_losses, k=dim + 1, largest=False)
+        # updated_simplex_values = all_values[sorted_indices]
+        
+        # # Update the SolutionBatch and track best solution
+        # self.simplex.set_values(updated_simplex_values.clone())
+        # self.simplex.set_evals(updated_losses.clone())
+
+        # # Store the new best solution
+        # best_idx = torch.argmin(updated_losses).item()
+        # self._pop_best = self.simplex[best_idx]
 
 
 class RandomSearcher(SearchAlgorithm):
-    pass
+    def __init__(self, 
+        problem: Problem, 
+        stdev_init = 1., 
+        center_init = None, 
+        popsize = None,
+        *,
+        L: float = 1.,
+        cont_coef: float = 0.5,
+        exp_coef: float = 2.,
+        L_max = 1.5,
+        L_min = 0.1,
+        tau_succ = 3,
+        tau_fail = 3,
+    ):
+        SearchAlgorithm.__init__(
+            self,
+            problem=problem, 
+            pop_best=self._get_pop_best,
+            pop_best_eval=self._get_pop_best_eval
+        )
+
+        self.L, self.cont_coef, self.exp_coef = L, cont_coef, exp_coef
+        self.L_max, self.L_min = L_max, L_min
+        self.tau_succ, self.tau_fail = tau_succ, tau_fail
+        self.cnt_succ, self.cnt_fail = 0, 0
+
+        self.center = center_init.clone().unsqueeze(0)
+        self.center_loss = float('inf')
+
+        # Dummy data for the logger to process
+        self.popsize, self.dim = popsize, problem.solution_length
+        self.batch = self.problem.generate_batch(popsize)
+        self._pop_best: Optional[Solution] = None
+
+    def _get_pop_best(self):
+        return self._pop_best
+
+    def _get_pop_best_eval(self):
+        return self._pop_best.evals[0].item()
+
+    def _step(self):
+        # Generate and evaluate candidates
+        # candidates = generate_low_discrepancy_normal(self.popsize, self.dim, ratio=0.7) * self.L + self.center
+        # candidates = generate_sigma_normal(self.popsize, self.dim) * self.L + self.center
+        sobol_points = torch.quasirandom.SobolEngine(
+            self.dim, scramble=True
+        ).draw(self.popsize).cuda()  # shape (popsize, dim)
+        candidates = self.L * (sobol_points - 0.5) + self.center  # scale and shift to the center
+        losses = self.problem.compute_loss(candidates)  # shape (popsize,)
+
+        # Update the center
+        best_idx = torch.argmin(losses).item()
+        if losses[best_idx] <= self.center_loss:
+            self.center = candidates[best_idx].unsqueeze(0)
+            self.center_loss = losses[best_idx].item()
+            self.cnt_succ += 1
+            self.cnt_fail = 0
+
+        else:
+            self.cnt_succ = 0
+            self.cnt_fail += 1
+
+        if self.cnt_succ >= self.tau_succ:
+            self.L = min(self.L * self.exp_coef, self.L_max)  # expand L
+            self.cnt_succ = 0
+
+        elif self.cnt_fail >= self.tau_fail:
+            self.L = max(self.L * self.cont_coef, self.L_min)  # shrink L
+            self.cnt_fail = 0
+
+        # print(self.L)
+
+        # self.L *= 0.8
+
+        # Update the best solution
+        self.batch.set_values(candidates.clone())
+        self.batch.set_evals(losses.clone())
+        self._pop_best = self.batch[best_idx]
 
 
 class Tracker:
     def __init__(
         self, model, robot_renderer, init_cTr, init_joint_angles, 
         num_iters=5, intr=None, p_local1=None, p_local2=None, 
-        stdev_init=1., searcher="CMA-ES", optimize_joint_angles=True
+        stdev_init=1., searcher="CMA-ES", optimize_joint_angles=True, args=None
     ):
         self.model = model
         self.robot_renderer = robot_renderer
@@ -594,6 +864,8 @@ class Tracker:
         self.intr = intr  
         self.p_local1 = p_local1  
         self.p_local2 = p_local2 
+
+        self.args = args
 
         self.fx, self.fy, self.px, self.py = intr[0, 0].item(), intr[1, 1].item(), intr[0, 2].item(), intr[1, 2].item()
 
@@ -611,25 +883,23 @@ class Tracker:
         #     self.problem = SimplePoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init)  # Problem will be set in track method
 
         assert optimize_joint_angles, "Currently only optimizing joint angles is supported."
-        self.problem = PoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init)
+        self.problem = PoseEstimationProblem(model, robot_renderer, None, intr, p_local1, p_local2, self.stdev_init, args)
 
         optimizer_dict = {
             "CMA-ES": CMAES_cus, # customized CMA-ES implementation
             "XNES": XNES,
             "SNES": SNES,
             "Gradient": GradientDescentSearcher,
-            "Nelder-Mead": NelderMeadSearcher,
+            "NelderMead": NelderMeadSearcher,
             "RandomSearch": RandomSearcher,
         }
         self.optimizer = optimizer_dict[searcher]
 
         # Transform the intial cTr to Euler angle if required
-        self.use_mix_angle = USE_MIX_ANGLE  
-        if self.use_mix_angle:
+        if self.args.use_mix_angle:
             print("[Using transformed angle space for optimization.]")
-            axis_angle = self._prev_cTr[:3].unsqueeze(0)  # shape (1, 3)
-            mix_angle = axis_angle_to_mix_angle(axis_angle)  # Convert to Euler angles
-            self._prev_cTr[:3] = mix_angle.squeeze(0)  # Replace the first 3 elements with Euler angles
+        elif self.args.use_unscented_transform:
+            print("[Using orthogonally transformed axis-angle space for optimization.]")
         else:
             print("[Using axis-angle space for optimization.]")
 
@@ -721,11 +991,11 @@ class Tracker:
         # Update the optimization problem
         ref_mask = mask.to(self.model.device)
         self.problem.update_problem(
-            ref_mask, ref_keypoints, det_line_params, joint_angles, self.stdev_init
+            ref_mask, ref_keypoints, det_line_params, joint_angles, self._prev_cTr.clone(), self.stdev_init
         )
-            
+
         # Initialize the solution with the previous cTr and joint angles
-        cTr = self._prev_cTr.clone()
+        cTr = self.problem.cTr_init
 
         # joint_angles = self._prev_joint_angles.clone() # ignore the current joint angles
         center_init = torch.cat([cTr, joint_angles], dim=0)
@@ -735,6 +1005,7 @@ class Tracker:
             problem=self.problem,
             stdev_init=1.,
             center_init=center_init / self.problem.lengthscales,
+            popsize=self.args.popsize,
         )
         logger = DummyLogger(searcher, interval=1, after_first_step=False)
         # logger2 = StdOutLogger(searcher, interval=1, after_first_step=False)
@@ -746,14 +1017,20 @@ class Tracker:
         cTr, joint_angles = best_solution[:6], best_solution[6:]
         loss = logger.best_eval
 
-        # Update the previous cTr and joint angles
-        self._prev_cTr = cTr.clone()
-        self._prev_joint_angles = joint_angles.clone()
-
-        if self.use_mix_angle:
+        # Convert the transformed rotation representations back to the axis-angle space
+        if self.args.use_mix_angle:
             mix_angle = cTr[:3].unsqueeze(0)
             axis_angle = mix_angle_to_axis_angle(mix_angle)  # Convert to axis-angle
             cTr[:3] = axis_angle.squeeze(0) # Replace the first 3 elements with axis-angle
+
+        elif self.args.use_unscented_transform:
+            transformed_angle = cTr[:3].unsqueeze(0)
+            axis_angle = transformed_angle @ self.problem.Q.T # transform back to the standard basis
+            cTr[:3] = axis_angle.squeeze(0)
+
+        # Update the previous cTr and joint angles
+        self._prev_cTr = cTr.clone()
+        self._prev_joint_angles = joint_angles.clone()
 
         if visualization:
             # Render the predicted mask for visualization

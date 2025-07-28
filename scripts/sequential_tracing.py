@@ -38,7 +38,7 @@ torch.cuda.empty_cache()
 def parseArgs():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mesh_dir", type=str, default="urdfs/dVRK/meshes")
-    parser.add_argument("--data_dir", type=str, default="data/consecutive_prediction/")  
+    parser.add_argument("--data_dir", type=str, default="consecutive_prediction")  
     parser.add_argument("--difficulty", type=str, default="0617")
     parser.add_argument("--frame_start", type=int, default=139) 
     parser.add_argument("--frame_end", type=int, default=160)  # End frame for the sequence
@@ -55,11 +55,29 @@ def parseArgs():
     parser.add_argument("--sample_number", type=int, default=200)
     parser.add_argument("--use_nvdiffrast", action="store_true")
     parser.add_argument("--use_bbox_optimizer", action="store_true") # Use XNES for initialization
-    parser.add_argument("--searcher", type=str, default="CMA-ES", choices=["CMA-ES", "XNES", "SNES", "Gradient", "Nelder-Mead", "RandomSearch"])  # Search algorithm to use
+    parser.add_argument("--searcher", type=str, default="CMA-ES", choices=["CMA-ES", "XNES", "SNES", "Gradient", "NelderMead", "RandomSearch"])  # Search algorithm to use
     parser.add_argument("--online_iters", type=int, default=10)  # Number of iterations for online tracking
     parser.add_argument("--tracking_visualization", action="store_true")  # Whether to visualize the tracking process
     parser.add_argument("--online_lr", type=float, default=1e-3)  # Learning rate for online tracking
     parser.add_argument("--use_filter", action="store_true")  # Use filter for tracking
+    parser.add_argument("--no_cache", action="store_true") # Use cached initialization
+
+    parser.add_argument('--use_render_loss', type=str2bool, default=True)
+    parser.add_argument('--use_pts_loss', type=str2bool, default=True)
+    parser.add_argument('--use_cyd_loss', type=str2bool, default=False)
+    parser.add_argument('--use_dht_loss', type=str2bool, default=False)
+
+    parser.add_argument('--use_mix_angle', type=str2bool, default=False)
+    parser.add_argument('--use_unscented_transform', type=str2bool, default=True)
+    parser.add_argument('--use_weighting_mask', type=str2bool, default=False)
+
+    parser.add_argument('--mse_weight', type=float, default=6.)
+    parser.add_argument('--dist_weight', type=float, default=12e-7)
+    parser.add_argument('--app_weight', type=float, default=6e-6)
+    parser.add_argument('--pts_weight', type=float, default=5e-3)
+    parser.add_argument('--cyd_weight', type=float, default=1e-2)
+
+    parser.add_argument('--popsize', type=int, default=70)
 
     stdev_init = torch.tensor([1., 1., 1., 1., 1., 1., 1., 1., 1., 1.], dtype=torch.float32).cuda() # Initial standard deviation for XNES/SNES
     stdev_init[:3] *= torch.tensor([1e-2, 1e-1, 1e-2], dtype=torch.float32).cuda() # angles (3D) (REMARK: set to 1e-1 if using axis angles)
@@ -70,6 +88,9 @@ def parseArgs():
 
     parser.add_argument("--log_interval", type=int, default=1000)  # Logging interval for optimization
     args = parser.parse_args()
+
+    args.use_dht_loss = args.use_dht_loss and not args.use_cyd_loss # cannot use dht_loss and cylinder_loss i the same time
+    args.use_unscented_transform = args.use_unscented_transform and not args.use_mix_angle
 
     return args
 
@@ -95,6 +116,17 @@ def parseCtRNetArgs():
     args.py = args.py * args.scale
 
     return args
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
 def buildcTr(cTr_train, cTr_nontrain):
@@ -452,6 +484,9 @@ if __name__ == "__main__":
     args = parseArgs()
     ctrnet_args = parseCtRNetArgs()
 
+    cache_filename = f"./data/cached_initialization/{args.data_dir}_{args.difficulty}_{args.frame_start}.pth"
+    args.data_dir = os.path.join("./data", args.data_dir)
+
     ctrnet_args.use_nvdiffrast = args.use_nvdiffrast
     if ctrnet_args.use_nvdiffrast:
         print("Using NvDiffRast!")
@@ -469,9 +504,19 @@ if __name__ == "__main__":
     robot_renderer.set_mesh_visibility([True, True, True, True])
 
     # Initialize the model
-    cTr, joint_angles = initialization(
-        model, data_lst[0], mesh_files
-    )  
+    if args.no_cache or not os.path.exists(cache_filename):
+        print("[Not using cache or the cache file is not found, running optimization-based initialization...]")
+        cTr, joint_angles = initialization(
+            model, data_lst[0], mesh_files
+        )  
+        torch.save({'cTr': cTr, 'joint_angles': joint_angles}, cache_filename)
+        print(f"[The cTr and joint angles are saved in {cache_filename}.]")
+
+    else:
+        print(f"[Found cache file at {cache_filename}.]")
+        cache = torch.load(cache_filename)
+        cTr = cache['cTr'].to(model.device)
+        joint_angles = cache['joint_angles'].to(model.device)
 
     # Camera intrinsic matrix
     intr = torch.tensor(
@@ -512,6 +557,7 @@ if __name__ == "__main__":
             p_local1=p_local1,
             p_local2=p_local2,
             searcher=args.searcher,
+            args=args,
         )
 
         # Track the rest of the frames
@@ -538,7 +584,7 @@ if __name__ == "__main__":
                 )
 
             else:
-                pass
+                raise NotImplementedError
 
             end_time = time.time()
 

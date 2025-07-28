@@ -6,7 +6,9 @@ from diffcali.models.CtRNet import CtRNet
 from diffcali.utils.angle_transform_utils import (
     mix_angle_to_axis_angle,
     axis_angle_to_mix_angle,
-    unscented_mix_angle_to_axis_angle
+    unscented_mix_angle_to_axis_angle,
+    enforce_quaternion_consistency,
+    enforce_axis_angle_consistency
 )
 
 import math
@@ -19,34 +21,6 @@ import cv2
 import argparse
 import time
 import warnings
-
-
-def smallest_diag_dominating_A_cvxpy(A: np.ndarray) -> np.ndarray:
-    import cvxpy
-    """
-    Given symmetric matrix A (3x3),
-    find diagonal D = diag(d) minimizing sum(d)
-    s.t. D - A is positive semidefinite.
-
-    Returns:
-        D: smallest diagonal matrix dominating A
-    """
-    assert A.shape == (3, 3)
-    assert np.allclose(A, A.T, atol=1e-8), "A must be symmetric"
-
-    d = cp.Variable(3, nonneg=True)  # diagonal entries
-
-    D = cp.diag(d)
-    constraints = [D - A >> 0]  # PSD constraint
-
-    prob = cp.Problem(cp.Minimize(cp.sum(d)), constraints)
-    prob.solve(solver=cp.SCS)  # or cp.MOSEK if available
-
-    if prob.status not in ["optimal", "optimal_inaccurate"]:
-        raise RuntimeError("Solver did not find an optimal solution")
-
-    D_opt = np.diag(d.value)
-    return D_opt
 
 
 def parseArgs():
@@ -143,7 +117,7 @@ def render(glctx, pos, pos_idx, resolution: [int, int], antialiasing=False):
     return color.squeeze(-1) # (B, H, W)
 
 
-if __name__ == "__main__":
+def main1():
     with torch.no_grad():
         warnings.filterwarnings("ignore", category=UserWarning)
         # torch.manual_seed(42)
@@ -318,25 +292,284 @@ if __name__ == "__main__":
             test_mix_angle = mix_angle_batch[i]
             stdev = torch.tensor([1e-2, 1e-1, 1e-2], dtype=torch.float32).cuda()
             mean_axis_angle, cov_axis_angle = unscented_mix_angle_to_axis_angle(test_mix_angle, stdev)
-            print("Mean:\n", mean_axis_angle)
-            print("Covariance:\n", cov_axis_angle)
+            # print("Mean:\n", mean_axis_angle)
+            # print("Covariance:\n", cov_axis_angle)
 
             # Compare with empirical mean and covariance
             generated_mix_angles = test_mix_angle + stdev * torch.randn(1000, 3).cuda()
             generated_axis_angles = mix_angle_to_axis_angle(generated_mix_angles)
             empirical_mean = generated_axis_angles.mean(dim=0)
             empirical_cov = torch.cov(generated_axis_angles.T)
-            print("Empirical Mean:\n", empirical_mean)
-            print("Empirical Covariance:\n", empirical_cov)
+            # print("Empirical Mean:\n", empirical_mean)
+            # print("Empirical Covariance:\n", empirical_cov)
 
             # Compute a diagonal stdev based on d_ii = sqrt(a_ii + \sum_{i\not=j} a_ij)
             diag = torch.diag(cov_axis_angle)  # shape (n,)
             off_diag_sum = torch.sum(torch.abs(cov_axis_angle), dim=1) - torch.abs(diag)
             diagonal_stdev = torch.sqrt(diag + off_diag_sum)
-            print("Diagonal Stdev:\n", diagonal_stdev)
+            # print("Diagonal Stdev:\n", diagonal_stdev)
 
-            # # Use CVXPY to find the smallest diagonal matrix dominating the covariance
-            # A = cov_axis_angle.cpu().numpy()
-            # D_opt = smallest_diag_dominating_A_cvxpy(A)
-            # opt_diagonal_stdev = torch.tensor(np.sqrt(np.diag(D_opt)), dtype=torch.float32).cuda()
-            # print("Optimal Diagonal Stdev (CVXPY):\n", opt_diagonal_stdev)
+            # Conduct SVD to the cov_axis_angle, output U and Sigma      
+            L, Q = torch.linalg.eigh(empirical_cov)
+            # print("Empirical Covariance:\n", empirical_cov)
+            if (L**0.5 > 0.1).any():
+                print("Eigenvalue^0.5:\n", L**0.5)
+            # print("Eigenvector:\n", Q)
+
+            # # Convert mix angle to axis angle, then to quaternions, compute empirical mean and covariance
+            # empirical_quat = kornia.geometry.conversions.axis_angle_to_quaternion(generated_axis_angles)
+            # empirical_quat = enforce_quaternion_consistency(empirical_quat)  # Ensure sign consistency
+            # empirical_mean_quat = empirical_quat.mean(dim=0)
+            # empirical_cov_quat = torch.cov(empirical_quat.T)
+            # # print("Empirical Mean Quaternion:\n", empirical_mean_quat)
+            # # print("Empirical Covariance Quaternion:\n", empirical_cov_quat)
+            # diag = torch.diag(empirical_cov_quat)
+            # off_diag_sum = torch.sum(torch.abs(empirical_cov_quat), dim=1) - torch.abs(diag)
+            # diagonal_stdev_quat = torch.sqrt(diag + off_diag_sum)
+            # # print("Diagonal Stdev Quaternion:\n", diagonal_stdev_quat)
+            # if (diagonal_stdev_quat > 0.01).any():
+            #     print(f"Warning: High diagonal stdev for sample {i+1}: {diagonal_stdev_quat}")
+            #     print()
+
+
+def main2():
+    with torch.no_grad():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        # torch.manual_seed(42)
+        # np.random.seed(42)
+
+        args = parseArgs()
+        
+        joints = np.load(args.joint_file)
+        jaw = np.load(args.jaw_file)
+
+        """Or just for a single image processing"""
+
+        # a.1) Build model
+        model = CtRNet(args)
+        mesh_files = [
+            f"{args.mesh_dir}/shaft_multi_cylinder.ply",
+            f"{args.mesh_dir}/logo_low_res_1.ply",
+            f"{args.mesh_dir}/jawright_lowres.ply",
+            f"{args.mesh_dir}/jawleft_lowres.ply",
+        ]
+
+        robot_renderer = model.setup_robot_renderer(mesh_files)
+        robot_renderer.set_mesh_visibility([True, True, True, True])
+
+        # a.2) Joint angles (same for all items, or replicate if needed)
+        joint_angles_np = np.array(
+            [joints[4], joints[5], jaw[0] / 2, jaw[0] / 2], dtype=np.float32
+        )
+        joint_angles = torch.tensor(
+            joint_angles_np, device=model.device, requires_grad=False, dtype=torch.float32
+        )
+        model.get_joint_angles(joint_angles)
+
+        robot_renderer.get_robot_mesh(joint_angles + 1) # warmup
+        start_time = time.time()
+        robot_mesh = robot_renderer.get_robot_mesh(joint_angles)
+        end_time = time.time()
+        print(f"Mesh computing time: {(end_time - start_time) * 1000 :.4f} ms")
+
+        # a.3) Generate all initial cTr in some way (N total). For demo, let's do random.
+        N = 2
+        cTr_inits = []
+        for i in range(N):
+            camera_roll_local = torch.empty(1).uniform_(
+                0, 360
+            )  # Random values in [0, 360]
+            camera_roll = torch.empty(1).uniform_(0, 360)  # Random values in [0, 360]
+            azimuth = torch.empty(1).uniform_(0, 360)  # Random values in [0, 360]
+            elevation = torch.empty(1).uniform_(
+                90 - 60, 90 - 30
+            )  # Random values in [90-25, 90+25]
+            # elevation = 30
+            distance = torch.empty(1).uniform_(0.10, 0.17)
+
+            pose_matrix = model.from_lookat_to_pose_matrix(
+                distance, elevation, camera_roll_local
+            )
+            roll_rad = torch.deg2rad(camera_roll)  # Convert roll angle to radians
+            roll_matrix = torch.tensor(
+                [
+                    [torch.cos(roll_rad), -torch.sin(roll_rad), 0],
+                    [torch.sin(roll_rad), torch.cos(roll_rad), 0],
+                    [0, 0, 1],
+                ]
+            )
+            pose_matrix[:, :3, :3] = torch.matmul(roll_matrix, pose_matrix[:, :3, :3])
+            cTr = model.pose_matrix_to_cTr(pose_matrix)
+            if not torch.any(torch.isnan(cTr)):
+                cTr_inits.append(cTr)
+        cTr_batch = torch.cat(cTr_inits, dim=0) # All samples in a single batch
+        B = cTr_batch.shape[0] 
+        
+        cTr_start = torch.cat([cTr_batch[0,:3], cTr_batch[1,3:]], dim=0)  # (1, 6)
+        cTr_end = cTr_batch[1] # (1, 6)
+        cTr_start = cTr_start * 0.2 + cTr_end * 0.8  # Mix the two poses
+        # print("Starting Pose:", cTr_start)
+        # print("Ending Pose:", cTr_end)
+
+        # Convert to axis-angle, mix angle, and quaternion
+        axis_angle_start = cTr_start[:3].unsqueeze(0)  # (1, 3)
+        axis_angle_end = cTr_end[:3].unsqueeze(0)
+        mix_angle_start = axis_angle_to_mix_angle(axis_angle_start)
+        mix_angle_end = axis_angle_to_mix_angle(axis_angle_end)
+        quaternion_start = kornia.geometry.conversions.axis_angle_to_quaternion(axis_angle_start)
+        quaternion_end = kornia.geometry.conversions.axis_angle_to_quaternion(axis_angle_end)
+        if (quaternion_start[0,1:] * quaternion_end[0,1:]).sum(dim=-1).item() < 0:
+            quaternion_end = -quaternion_end
+
+        print("Axis-Angle Start:", axis_angle_start)
+        print("Axis-Angle End:", axis_angle_end)
+        print("Mix Angle Start:", mix_angle_start)
+        print("Mix Angle End:", mix_angle_end)
+        print("Quaternion Start:", quaternion_start)
+        print("Quaternion End:", quaternion_end)
+
+        # Interpolate and convert back to axis angles
+        num_steps = 30
+        axis_angle_interpolated = torch.lerp(axis_angle_start, axis_angle_end, torch.linspace(0, 1, num_steps).unsqueeze(1).cuda())
+        mix_angle_interpolated = torch.lerp(mix_angle_start, mix_angle_end, torch.linspace(0, 1, num_steps).unsqueeze(1).cuda())
+        # quaternion_interpolated = torch.slerp(quaternion_start, quaternion_end, torch.linspace(0, 1, num_steps).unsqueeze(1).cuda())
+        q1 = kornia.geometry.quaternion.Quaternion(quaternion_start)
+        q2 = kornia.geometry.quaternion.Quaternion(quaternion_end)
+        quaternion_interpolated = []
+        for t in torch.linspace(0, 1, num_steps):
+            q3 = q1.slerp(q2, t)
+            quaternion_interpolated.append(q3.q)
+        quaternion_interpolated = torch.stack(quaternion_interpolated, dim=0).squeeze()
+
+        axis_angle_interpolated_from_mix = mix_angle_to_axis_angle(mix_angle_interpolated)
+        axis_angle_interpolated_from_quat = kornia.geometry.conversions.quaternion_to_axis_angle(quaternion_interpolated)
+
+        cTr_axis_angle = torch.cat([axis_angle_interpolated, cTr_batch[0,3:].unsqueeze(0).repeat(num_steps, 1)], dim=-1)
+        cTr_mix_angle = torch.cat([axis_angle_interpolated_from_mix, cTr_batch[0,3:].unsqueeze(0).repeat(num_steps, 1)], dim=-1)
+        cTr_quaternion = torch.cat([axis_angle_interpolated_from_quat, cTr_batch[0,3:].unsqueeze(0).repeat(num_steps, 1)], dim=-1)
+
+        # Render silhouette shaders of the interpolated poses
+        # b.1) Configure NvDiffRast renderer
+        glctx = dr.RasterizeCudaContext() # CUDA context (OpenGL is not available in my WSL)
+        resolution = (args.height, args.width)
+
+        # b.2) Render for axis angle interpolation
+
+        def get_pos_and_idx(cTr_batch, num_steps=num_steps):
+            R_batched = kornia.geometry.conversions.angle_axis_to_rotation_matrix(
+                cTr_batch[:, :3]
+            ) 
+            R_batched = R_batched.transpose(1, 2)
+            T_batched = cTr_batch[:, 3:] 
+            negative_mask = T_batched[:, -1] < 0  #flip where negative_mask is True
+            T_batched_ = T_batched.clone()
+            T_batched_[negative_mask] = -T_batched_[negative_mask]
+            R_batched_ = R_batched.clone()
+            R_batched_[negative_mask] = -R_batched_[negative_mask]
+            pos, pos_idx = transform_mesh(
+                cameras=robot_renderer.cameras, mesh=robot_mesh.extend(num_steps),
+                R=R_batched_, T=T_batched_, args=args
+            ) # project the batched meshes in the clip space
+            
+            # Check if all instance in pos_idx are the same
+            for i in range(1, len(pos_idx)):
+                assert torch.all(pos_idx[0] == pos_idx[i]), "Different instance indices in the batch"
+            
+            return pos, pos_idx
+
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for .mp4
+        fps = 10  # Adjust as needed
+
+        pos, pos_idx = get_pos_and_idx(cTr_axis_angle)
+
+        # output_path = "./interpolation_visualization/axis_angle_interpolation.mp4"
+        # video_writer_axis = cv2.VideoWriter(output_path, fourcc, fps, (args.width, args.height))
+        
+        pred_masks_axis = render(glctx, pos, pos_idx[0], resolution) # instance mode, all topologies (pos_idx) are the same
+
+        # pred_masks = pred_masks_axis.cpu().numpy()
+        # for i in range(args.sample_number):
+        #     img = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+        #     img[..., 0] = (pred_masks[i] * 255).astype(np.uint8) # blue for current frame
+        #     # if i > 0:
+        #     #     img[..., 2] = (pred_masks[i-1] * 255).astype(np.uint8) # red for previous frame
+        #     cv2.putText(img, f"Frame {i+1}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        #     # cv2.imshow("Rendered Masks for Axis Angle Interpolation", img)
+        #     # cv2.waitKey(0)
+        #     video_writer_axis.write(img)
+
+        # b.3) Render for mix angle interpolation
+        pos, pos_idx = get_pos_and_idx(cTr_mix_angle)
+
+        # output_path = "./interpolation_visualization/transformed_angle_interpolation.mp4"
+        # video_writer_mix = cv2.VideoWriter(output_path, fourcc, fps, (args.width, args.height))
+        
+        pred_masks_mix = render(glctx, pos, pos_idx[0], resolution) # instance mode, all topologies (pos_idx) are the same
+
+        # pred_masks = pred_masks_mix.cpu().numpy()
+        # for i in range(args.sample_number):
+        #     img = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+        #     img[..., 0] = (pred_masks[i] * 255).astype(np.uint8) # blue for current frame
+        #     # if i > 0:
+        #     #     img[..., 2] = (pred_masks[i-1] * 255).astype(np.uint8) # red for previous frame
+        #     cv2.putText(img, f"Frame {i+1}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        #     # cv2.imshow("Rendered Masks for Mix Angle Interpolation", img)
+        #     # cv2.waitKey(0)
+        #     video_writer_mix.write(img)
+
+        # b.4) Render for quaternion interpolation
+        pos, pos_idx = get_pos_and_idx(cTr_quaternion)
+
+        # output_path = "./interpolation_visualization/quaternion_interpolation.mp4"
+        # video_writer_quats = cv2.VideoWriter(output_path, fourcc, fps, (args.width, args.height))
+        
+        pred_masks_quat = render(glctx, pos, pos_idx[0], resolution) # instance mode, all topologies (pos_idx) are the same
+
+        # pred_masks = pred_masks_quat.cpu().numpy()
+        # for i in range(args.sample_number):
+        #     img = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+        #     img[..., 0] = (pred_masks[i] * 255).astype(np.uint8) # blue for current frame
+        #     # if i > 0:
+        #     #     img[..., 2] = (pred_masks[i-1] * 255).astype(np.uint8) # red for previous frame
+        #     cv2.putText(img, f"Frame {i+1}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        #     # cv2.imshow("Rendered Masks for Quaternion Interpolation", img)
+        #     # cv2.waitKey(0)
+        #     video_writer_quats.write(img)
+
+        # Render all interpolated poses in a single video
+        output_path = "./interpolation_visualization/all_interpolations.mp4"
+        video_writer_all = cv2.VideoWriter(output_path, fourcc, fps, (args.width, args.height))
+
+        pred_masks_axis = pred_masks_axis.cpu().numpy()
+        pred_masks_mix = pred_masks_mix.cpu().numpy()
+        pred_masks_quat = pred_masks_quat.cpu().numpy()
+
+        for i in range(args.sample_number):
+            img = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+            img[..., 0] = (pred_masks_axis[i] * 255).astype(np.uint8) 
+            img[..., 1] = (pred_masks_mix[i] * 255).astype(np.uint8) + (pred_masks_axis[i] * 200).astype(np.uint8) // 2  # mix color
+            img[..., 2] = (pred_masks_quat[i] * 255).astype(np.uint8) + (pred_masks_axis[i] * 100).astype(np.uint8) // 2  # mix color
+
+            cv2.putText(img, f"Frame {i+1}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            # puttext to label the colors (light blue for axis angle, green for mix angle, red for quaternion)
+            cv2.putText(img, "Axis Angle", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1)
+            cv2.putText(img, "Transformed Angle", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.putText(img, "Quaternion", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            # cv2.imshow("All Interpolations", img)
+            # cv2.waitKey(0)
+            video_writer_all.write(img)
+
+
+        # video_writer_axis.release()
+        # video_writer_mix.release()
+        # video_writer_quats.release()
+        video_writer_all.release()
+        print(f"Saved video to ./interpolation_visualization/")
+
+
+
+
+if __name__ == "__main__":
+    main1()
+    # main2()

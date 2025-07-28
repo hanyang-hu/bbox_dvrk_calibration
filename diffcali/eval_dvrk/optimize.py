@@ -372,7 +372,8 @@ class Optimize(object):
             dtype=self.cTr_train[3].dtype,
         )
 
-        for idx in tqdm(range(iterations), desc="optimizing the pose..."):
+        progress_bar = tqdm(range(iterations), desc="optimizing the pose...")
+        for idx in progress_bar:
             self.model.get_joint_angles(self.cTr_train[3])
             # import time
             # start_time = time.time()
@@ -505,6 +506,8 @@ class Optimize(object):
                 loss.backward()  # On the last iteration, no need to retain the graph
             # th.nn.utils.clip_grad_norm_([self.cTr_train], max_norm = 1)
             self.optimizer.step()
+
+            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
             # scheduler.step()
 

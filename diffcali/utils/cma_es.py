@@ -146,7 +146,7 @@ class CMAES_cus(CMAES):
         separable: bool = False,
         limit_C_decomposition: bool = True,
         obj_index: Optional[int] = None,
-        mu_size: Optional[int] = 10 # NOTE. Modified to 10
+        mu_size: Optional[int] = 15 # NOTE. Modified to 15
     ):
         """
         `__init__(...)`: Initialize the CMAES solver.

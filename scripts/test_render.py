@@ -7,8 +7,10 @@ from diffcali.utils.angle_transform_utils import (
     mix_angle_to_axis_angle,
     axis_angle_to_mix_angle,
     unscented_mix_angle_to_axis_angle,
+    # unscented_mix_angle_to_local_quaternion,
     enforce_quaternion_consistency,
-    enforce_axis_angle_consistency
+    enforce_axis_angle_consistency,
+    find_local_quaternion_basis,
 )
 
 import math
@@ -194,6 +196,9 @@ def main1():
         angle_axis_batch = cTr_batch[:, :3]  # Extract axis-angle part
         mix_angle_batch = axis_angle_to_mix_angle(angle_axis_batch)  # Convert to Euler angles
         axis_angle_converted = mix_angle_to_axis_angle(mix_angle_batch)
+        quaternion = kornia.geometry.conversions.axis_angle_to_quaternion(axis_angle_converted)
+        quaternion = quaternion / quaternion.norm() + 0
+        axis_angle_converted = kornia.geometry.conversions.quaternion_to_axis_angle(quaternion)
 
         # Test the conversion accuracy
         R = kornia.geometry.conversions.axis_angle_to_rotation_matrix(angle_axis_batch)
@@ -291,45 +296,56 @@ def main1():
         for i in range(args.sample_number):
             test_mix_angle = mix_angle_batch[i]
             stdev = torch.tensor([1e-2, 1e-1, 1e-2], dtype=torch.float32).cuda()
-            mean_axis_angle, cov_axis_angle = unscented_mix_angle_to_axis_angle(test_mix_angle, stdev)
+            # mean_axis_angle, cov_axis_angle = unscented_mix_angle_to_axis_angle(test_mix_angle, stdev)
             # print("Mean:\n", mean_axis_angle)
-            # print("Covariance:\n", cov_axis_angle)
+            # # print("Covariance:\n", cov_axis_angle)
 
-            # Compare with empirical mean and covariance
-            generated_mix_angles = test_mix_angle + stdev * torch.randn(1000, 3).cuda()
-            generated_axis_angles = mix_angle_to_axis_angle(generated_mix_angles)
-            empirical_mean = generated_axis_angles.mean(dim=0)
-            empirical_cov = torch.cov(generated_axis_angles.T)
-            # print("Empirical Mean:\n", empirical_mean)
-            # print("Empirical Covariance:\n", empirical_cov)
+            # # Compare with empirical mean and covariance
+            # generated_mix_angles = test_mix_angle + stdev * torch.randn(1000, 3).cuda()
+            # generated_axis_angles = mix_angle_to_axis_angle(generated_mix_angles)
+            # empirical_mean = generated_axis_angles.mean(dim=0)
+            # empirical_cov = torch.cov(generated_axis_angles.T)
+            # # print("Empirical Mean:\n", empirical_mean)
+            # # print("Empirical Covariance:\n", empirical_cov)
 
-            # Compute a diagonal stdev based on d_ii = sqrt(a_ii + \sum_{i\not=j} a_ij)
-            diag = torch.diag(cov_axis_angle)  # shape (n,)
-            off_diag_sum = torch.sum(torch.abs(cov_axis_angle), dim=1) - torch.abs(diag)
-            diagonal_stdev = torch.sqrt(diag + off_diag_sum)
-            # print("Diagonal Stdev:\n", diagonal_stdev)
+            # # Compute a diagonal stdev based on d_ii = sqrt(a_ii + \sum_{i\not=j} a_ij)
+            # diag = torch.diag(cov_axis_angle)  # shape (n,)
+            # off_diag_sum = torch.sum(torch.abs(cov_axis_angle), dim=1) - torch.abs(diag)
+            # diagonal_stdev = torch.sqrt(diag + off_diag_sum)
+            # # print("Diagonal Stdev:\n", diagonal_stdev)
 
-            # Conduct SVD to the cov_axis_angle, output U and Sigma      
-            L, Q = torch.linalg.eigh(empirical_cov)
-            # print("Empirical Covariance:\n", empirical_cov)
-            if (L**0.5 > 0.1).any():
-                print("Eigenvalue^0.5:\n", L**0.5)
-            # print("Eigenvector:\n", Q)
+            q0, local_q0, basis_4D, _ = find_local_quaternion_basis(test_mix_angle, stdev)
+            
+            # convert to local coordinates of quaternionss
+            axis_angle_batch = mix_angle_to_axis_angle(mix_angle_batch)
+            quaternion_batch = kornia.geometry.conversions.axis_angle_to_quaternion(axis_angle_batch)
+            quaternion_batch = enforce_quaternion_consistency(quaternion_batch)
 
-            # # Convert mix angle to axis angle, then to quaternions, compute empirical mean and covariance
-            # empirical_quat = kornia.geometry.conversions.axis_angle_to_quaternion(generated_axis_angles)
-            # empirical_quat = enforce_quaternion_consistency(empirical_quat)  # Ensure sign consistency
-            # empirical_mean_quat = empirical_quat.mean(dim=0)
-            # empirical_cov_quat = torch.cov(empirical_quat.T)
-            # # print("Empirical Mean Quaternion:\n", empirical_mean_quat)
-            # # print("Empirical Covariance Quaternion:\n", empirical_cov_quat)
-            # diag = torch.diag(empirical_cov_quat)
-            # off_diag_sum = torch.sum(torch.abs(empirical_cov_quat), dim=1) - torch.abs(diag)
-            # diagonal_stdev_quat = torch.sqrt(diag + off_diag_sum)
-            # # print("Diagonal Stdev Quaternion:\n", diagonal_stdev_quat)
-            # if (diagonal_stdev_quat > 0.01).any():
-            #     print(f"Warning: High diagonal stdev for sample {i+1}: {diagonal_stdev_quat}")
-            #     print()
+            q_unit = quaternion_batch / quaternion_batch.norm(dim=1, keepdim=True) 
+            # dots = torch.sum(q * q0.unsqueeze(0), dim=1, keepdim=True)  # (B,1)
+            # q_proj = q / dots - q0.unsqueeze(0) # (B,4)
+            # local_3D = q_proj @ basis_4D  
+
+            # project onto the plane
+            dots    = (q_unit * q0).sum(dim=1, keepdim=True)          # (B,1)
+            p       = q_unit / dots                                   # (B,4)
+            v       = p - q0.unsqueeze(0)                             # (B,4)
+            local3  = v @ basis_4D                                    # (B,3)
+
+            # back to 4D
+            v_hat       = local3 @ basis_4D.T                         # (B,4)
+            p_hat       = v_hat + q0.unsqueeze(0)                     # (B,4)
+            q_hat       = p_hat / p_hat.norm(dim=1, keepdim=True)     # (B,4)
+
+            s = torch.sign((q_unit * q_hat).sum(dim=1, keepdim=True))  # (B,1), ±1
+            q_hat = q_hat * s         
+
+            # print("Local coordinates: \n", local3)
+
+            # convert back to 4D quaternions
+            # converted_quaternion = local_3D @ basis_4D.T + q0
+            # converted_quaternion = converted_quaternion / converted_quaternion.norm(dim=1, keepdim=True)
+            print("Conversion error: ", (q_unit - q_hat).abs().max())
 
 
 def main2():

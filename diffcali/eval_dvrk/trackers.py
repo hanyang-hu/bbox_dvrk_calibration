@@ -1,6 +1,7 @@
 import torch
 import torch as th
 import torch.nn.functional as F
+import kornia
 import FastGeodis
 import numpy as np
 import math
@@ -21,6 +22,7 @@ from diffcali.utils.angle_transform_utils import (
     mix_angle_to_axis_angle,
     axis_angle_to_mix_angle,
     unscented_mix_angle_to_axis_angle,
+    find_local_quaternion_basis,
 )
 from diffcali.utils.cma_es import (
     CMAES_cus, 
@@ -34,27 +36,10 @@ from evotorch.logging import Logger, StdOutLogger
 
 
 torch.set_default_dtype(torch.float32)
+# torch.autograd.set_detect_anomaly(True)
 
-
-# # Loss settings
-# self.args.use_render_loss = True
-# self.args.use_pts_loss = True  # whether to use keypoint loss
-# self.args.use_cyd_loss = False # whether to use cylinder loss
-# self.args.use_dht_loss = False and not self.args.use_cyd_loss # whether to use DHT loss (if cylinder loss is not used)
-
-# self.args.mse_weight = 6.  # weight for the MSE loss
-# self.args.dist_weight = 12e-7 # weight for the distance loss (based on Euclidean distance transform)
-# self.args.app_weight = 6e-6 # 
-# self.args.pts_weight = 5e-3  # weight for the keypoint loss
-# self.args.cyd_weight = 1e-2 if self.args.use_dht_loss else 1e-2 # weight for the cylinder loss
-
-# self.args.popsize = 70  # Population size for the search algorithm
-
-
-# # Objective Setting
-# self.args.use_mix_angle = False
-# self.args.use_unscented_transform = True and not self.args.use_mix_angle
-# self.args.use_weighting_mask = False
+LOWER_BOUNDS = [-math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi]
+UPPER_BOUNDS = [math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi]
 
 
 def convert_line_params_to_endpoints(a, b, image_width, image_height):
@@ -243,12 +228,9 @@ class PoseEstimationProblem(Problem):
     ):
         super().__init__(
             objective_sense="min",
-            solution_length=10, 
+            solution_length=11 if args.use_global_quaternion else 10, 
             device=model.device,
-            initial_bounds=(
-                [-math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi],
-                [math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi, math.pi],
-            )
+            initial_bounds=(LOWER_BOUNDS, UPPER_BOUNDS) if args.use_global_quaternion else (LOWER_BOUNDS[:10], UPPER_BOUNDS[:10])
         )
 
         self.model = model
@@ -350,6 +332,7 @@ class PoseEstimationProblem(Problem):
 
         # Transform the initial rotation representations
         self.cTr_init = cTr_init
+        self.pose_dim = 6
 
         if self.args.use_mix_angle:
             axis_angle = cTr_init[:3].unsqueeze(0)  # shape (1, 3)
@@ -358,7 +341,7 @@ class PoseEstimationProblem(Problem):
 
         elif self.args.use_unscented_transform:
             # Use unscented transform to obtain the Gaussian distribution in axis-angle space
-            axis_angle = cTr_init[:3].unsqueeze(0)  # shape (1, 3)
+            axis_angle = cTr_init[:3].clone().unsqueeze(0)  # shape (1, 3)
             mix_angle = axis_angle_to_mix_angle(axis_angle).squeeze()  # Convert to Euler angles
             mean_aa, cov_aa = unscented_mix_angle_to_axis_angle(mix_angle, stdev_init[:3])
 
@@ -367,6 +350,20 @@ class PoseEstimationProblem(Problem):
             self.cTr_init[:3] = mean_aa @ Q # transform the mean to the new basis
             self.lengthscales[:3] = torch.sqrt(torch.clamp(L, min=1e-9)) # avoid numerical instability
             self.Q = Q
+
+        elif self.args.use_local_quaternion:
+            axis_angle = cTr_init[:3].clone().unsqueeze(0)
+            mix_angle = axis_angle_to_mix_angle(axis_angle).squeeze()
+            ret = find_local_quaternion_basis(mix_angle, stdev_init[:3])
+            self.q0, self.cTr_init[:3], self.basis_4D, self.lengthscales[:3] = ret
+            # self.lengthscales[:3] *= 0.42
+
+        elif self.args.use_global_quaternion:
+            axis_angle = cTr_init[:3].unsqueeze(0)
+            quaternion = kornia.geometry.conversions.axis_angle_to_quaternion(axis_angle).squeeze()
+            quaternion = quaternion / quaternion.norm()
+            self.cTr_init = torch.cat([quaternion, self.cTr_init[3:]])
+            self.pose_dim = 7
 
     def cylinder_loss_batch(
         self, position, direction, pose_matrix, radius
@@ -401,9 +398,9 @@ class PoseEstimationProblem(Problem):
 
     def compute_loss(self, raw_values):
         values = raw_values * self.lengthscales # scale the values by the lengthscales
-
-        raw_cTr_batch = values[:, :6]  # shape (B, 6)
-        joint_angles = values[:, 6:]  # shape (B, 4)
+            
+        raw_cTr_batch = values[:, :self.pose_dim]  # shape (B, 6)
+        joint_angles = values[:, self.pose_dim:]  # shape (B, 4)
         B = raw_cTr_batch.shape[0]
 
         if self.args.use_mix_angle:
@@ -419,6 +416,21 @@ class PoseEstimationProblem(Problem):
             axis_angle_batch = transformed_angle_batch @ self.Q.T # transform back to the standard basis
             cTr_batch = torch.cat(
                 [axis_angle_batch, raw_cTr_batch[:, 3:]], dim=1
+            ) 
+
+        elif self.args.use_local_quaternion:
+            local_3D_batch = raw_cTr_batch[:, :3] # local 3D coordinatess
+            q = local_3D_batch @ self.basis_4D.T + self.q0.unsqueeze(0) # standard 4D coordiantes
+            axis_angle_batch = kornia.geometry.conversions.quaternion_to_axis_angle(q)
+            cTr_batch = torch.cat(
+                [axis_angle_batch, raw_cTr_batch[:, 3:]], dim=1
+            ) 
+
+        elif self.args.use_global_quaternion:
+            quaternion_batch = raw_cTr_batch[:, :4]
+            axis_angle_batch = kornia.geometry.conversions.quaternion_to_axis_angle(quaternion_batch)
+            cTr_batch = torch.cat(
+                [axis_angle_batch, raw_cTr_batch[:, 4:]], dim=1
             ) 
 
         else:
@@ -583,7 +595,7 @@ class GradientDescentSearcher(SearchAlgorithm):
         #     center_init = candidates[idx]  # shape (dim,)
 
         # Initialize the variables and optimizer
-        self.vars = center_init.clone().unsqueeze(0).requires_grad_(True)
+        self.vars = center_init.detach().clone().unsqueeze(0).requires_grad_(True)
         self.optimizer = torch.optim.Adam([self.vars], lr=1.)
 
         # Dummy data for the logger to process
@@ -602,7 +614,7 @@ class GradientDescentSearcher(SearchAlgorithm):
 
         loss = self.problem.compute_loss(self.vars).squeeze()
 
-        loss.backward()
+        loss.backward(retain_graph=True)
 
         self.optimizer.step()
 
@@ -900,6 +912,10 @@ class Tracker:
             print("[Using transformed angle space for optimization.]")
         elif self.args.use_unscented_transform:
             print("[Using orthogonally transformed axis-angle space for optimization.]")
+        elif self.args.use_local_quaternion:
+            print("[Using local 3D parameterizations of quaternions for optimization.]")
+        elif self.args.use_global_quaternion:
+            print("[Using 4D quaternions for optimization.]")
         else:
             print("[Using axis-angle space for optimization.]")
 
@@ -996,6 +1012,7 @@ class Tracker:
 
         # Initialize the solution with the previous cTr and joint angles
         cTr = self.problem.cTr_init
+        joint_angles = self._prev_joint_angles if self.args.use_prev_joint_angles else joint_angles
 
         # joint_angles = self._prev_joint_angles.clone() # ignore the current joint angles
         center_init = torch.cat([cTr, joint_angles], dim=0)
@@ -1014,23 +1031,34 @@ class Tracker:
 
         # Extract the best solution and evaluation from the logger
         best_solution = logger.best_solution * self.problem.lengthscales
-        cTr, joint_angles = best_solution[:6], best_solution[6:]
+        cTr, joint_angles = best_solution[:self.problem.pose_dim], best_solution[self.problem.pose_dim:]
         loss = logger.best_eval
 
         # Convert the transformed rotation representations back to the axis-angle space
         if self.args.use_mix_angle:
             mix_angle = cTr[:3].unsqueeze(0)
-            axis_angle = mix_angle_to_axis_angle(mix_angle)  # Convert to axis-angle
-            cTr[:3] = axis_angle.squeeze(0) # Replace the first 3 elements with axis-angle
+            axis_angle = mix_angle_to_axis_angle(mix_angle) # Convert to axis-angle
+            cTr = torch.cat([axis_angle.squeeze(), cTr[3:]], dim=0)       # Replace the first 3 elements with axis-angle
 
         elif self.args.use_unscented_transform:
             transformed_angle = cTr[:3].unsqueeze(0)
             axis_angle = transformed_angle @ self.problem.Q.T # transform back to the standard basis
-            cTr[:3] = axis_angle.squeeze(0)
+            cTr = torch.cat([axis_angle.squeeze(), cTr[3:]], dim=0)
+
+        elif self.args.use_local_quaternion:
+            local_3D = cTr[:3].unsqueeze(0) # local 3D coordinates
+            q = local_3D @ self.problem.basis_4D.T + self.problem.q0.unsqueeze(0) # standard 4D coordiantes
+            axis_angle = kornia.geometry.conversions.quaternion_to_axis_angle(q)
+            cTr = torch.cat([axis_angle.squeeze(), cTr[3:]], dim=0)      
+
+        elif self.args.use_global_quaternion:
+            quaternion = cTr[:4].unsqueeze(0)
+            axis_angle = kornia.geometry.conversions.quaternion_to_axis_angle(quaternion)
+            cTr = torch.cat([axis_angle.squeeze(), cTr[4:]])
 
         # Update the previous cTr and joint angles
-        self._prev_cTr = cTr.clone()
-        self._prev_joint_angles = joint_angles.clone()
+        self._prev_cTr = cTr.detach().clone()
+        self._prev_joint_angles = joint_angles.detach().clone()
 
         if visualization:
             # Render the predicted mask for visualization

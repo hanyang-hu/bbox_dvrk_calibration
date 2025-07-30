@@ -165,3 +165,40 @@ def unscented_mix_angle_to_axis_angle(mix_angle: torch.Tensor, stdev: torch.Tens
 
     return mean, cov
 
+
+def find_local_quaternion_basis(mix_angle: torch.Tensor, stdev: torch.Tensor) -> torch.Tensor:
+    D = 3
+    assert mix_angle.shape == (3,)
+    assert stdev.shape == (3,)
+
+    # Generate sigma points for each batch element
+    # c = torch.sqrt(torch.tensor(3.0, device=stdev.device))  # scaling factor
+    # sigma_offsets = torch.stack([
+    #     torch.zeros(3, device=stdev.device),             # mean
+    #     c * stdev * torch.tensor([1, 0, 0], device=stdev.device),
+    #     c * stdev * torch.tensor([0, 1, 0], device=stdev.device),
+    #     c * stdev * torch.tensor([0, 0, 1], device=stdev.device),
+    #     -c * stdev * torch.tensor([1, 0, 0], device=stdev.device),
+    #     -c * stdev * torch.tensor([0, 1, 0], device=stdev.device),
+    #     -c * stdev * torch.tensor([0, 0, 1], device=stdev.device),
+    # ]) 
+    # samples = mix_angle[None, :] + sigma_offsets  # (7, 3)
+    sample_number = 1000
+    samples = torch.randn(sample_number, 3).cuda() * stdev.unsqueeze(0) + mix_angle[None, :]
+
+    # Transform sigma points to quaternions
+    axis_angle = mix_angle_to_axis_angle(samples)
+    q = kornia.geometry.conversions.axis_angle_to_quaternion(axis_angle)
+    q_norm = q / q.norm(dim=1, keepdim=True) # ensure unit norm
+    q_proj = q_norm / torch.sum(q_norm * q_norm[0], dim=1, keepdim=True) - q_norm[0].unsqueeze(0) # intersection of the ray {t*q[i]} with the tangent plane at q[0]
+
+    # Find 4D basis of the 3D tangent space by eigen-decomposition
+    diff = q_proj - q_proj.mean(dim=0).unsqueeze(0)
+    cov_4D = diff.T @ diff / sample_number
+    eigvals_4D, eigvecs_4D = torch.linalg.eigh(cov_4D)
+    basis_4D = eigvecs_4D[:, 1:]  # remove the direction with (almost) zero variance
+    lengthscales = torch.sqrt(eigvals_4D[1:])
+
+    # print(lengthscales)
+
+    return q_norm[0], q_proj[0] @ basis_4D, basis_4D, lengthscales

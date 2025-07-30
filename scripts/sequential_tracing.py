@@ -67,9 +67,14 @@ def parseArgs():
     parser.add_argument('--use_cyd_loss', type=str2bool, default=False)
     parser.add_argument('--use_dht_loss', type=str2bool, default=False)
 
-    parser.add_argument('--use_mix_angle', type=str2bool, default=False)
-    parser.add_argument('--use_unscented_transform', type=str2bool, default=True)
+    # parser.add_argument('--use_mix_angle', type=str2bool, default=False)
+    # parser.add_argument('--use_unscented_transform', type=str2bool, default=False)
+    # parser.add_argument('--use_local_quaternion', type=str2bool, default=False)
+    # parser.add_argument('--use_global_quaternion', type=str2bool, default=True)
     parser.add_argument('--use_weighting_mask', type=str2bool, default=False)
+    parser.add_argument('--use_prev_joint_angles', type=str2bool, default=False)
+
+    parser.add_argument('--rotation_parameterization', type=str, default="AxisAngle", choices=["Default", "MixAngle", "UnscentedTransform", "LocalQuaternion", "GlobalQuaternion"])
 
     parser.add_argument('--mse_weight', type=float, default=6.)
     parser.add_argument('--dist_weight', type=float, default=12e-7)
@@ -79,18 +84,30 @@ def parseArgs():
 
     parser.add_argument('--popsize', type=int, default=70)
 
-    stdev_init = torch.tensor([1., 1., 1., 1., 1., 1., 1., 1., 1., 1.], dtype=torch.float32).cuda() # Initial standard deviation for XNES/SNES
+    stdev_init = torch.tensor([1., 1., 1., 1., 1., 1., 1., 1., 1., 1.], dtype=torch.float32).cuda() # Initial standard deviation for CMA-ES
     stdev_init[:3] *= torch.tensor([1e-2, 1e-1, 1e-2], dtype=torch.float32).cuda() # angles (3D) (REMARK: set to 1e-1 if using axis angles)
     stdev_init[3:6] *= 1e-3 # translations (3D)
     stdev_init[6:] *= 1e-2 # joint angles (4D)
     stdev_init = stdev_init.detach()
+
     parser.add_argument("--stdev_init", type=RealOrVector, default=stdev_init)  # Standard deviation for initial noise in XNES
 
     parser.add_argument("--log_interval", type=int, default=1000)  # Logging interval for optimization
     args = parser.parse_args()
 
+    args.use_mix_angle = args.rotation_parameterization == "MixAngle"
+    args.use_unscented_transform = args.rotation_parameterization == "UnscentedTransform"
+    args.use_local_quaternion = args.rotation_parameterization == "LocalQuaternion"
+    args.use_global_quaternion = args.rotation_parameterization == "GlobalQuaternion"
+
     args.use_dht_loss = args.use_dht_loss and not args.use_cyd_loss # cannot use dht_loss and cylinder_loss i the same time
-    args.use_unscented_transform = args.use_unscented_transform and not args.use_mix_angle
+
+    if args.rotation_parameterization == "Default":
+        args.stdev_init[:3] = 1e-1
+    
+    if args.use_global_quaternion:
+        quat_stdev_init = torch.tensor([1e-2, 1e-2, 1e-2, 1e-2], dtype=torch.float32).cuda() # Initial standard deviation for 4D quaternions
+        args.stdev_init = torch.cat([quat_stdev_init, args.stdev_init[3:]])
 
     return args
 

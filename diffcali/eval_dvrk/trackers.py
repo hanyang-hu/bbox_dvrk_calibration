@@ -29,6 +29,7 @@ from diffcali.utils.cma_es import (
     generate_sigma_normal,
     generate_low_discrepancy_normal,
 )
+from diffcali.utils.pathwise_conditioning import PathwiseSampler
 
 from evotorch import Problem, SolutionBatch
 from evotorch.algorithms import SearchAlgorithm, SNES, XNES, CMAES
@@ -36,6 +37,7 @@ from evotorch.logging import Logger, StdOutLogger
 
 
 torch.set_default_dtype(torch.float32)
+torch._functorch.config.donated_buffer=False
 # torch.autograd.set_detect_anomaly(True)
 
 LOWER_BOUNDS = [-math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi, -math.pi]
@@ -215,9 +217,6 @@ class DummyLogger(Logger):
             self.best_solution = status["pop_best"].values.clone()
             self.best_eval = status["pop_best_eval"]
             # print(f"New best solution found: {self.best_solution}, evaluation: {self.best_eval}")
-
-        # self.best_solution = status["pop_best"].values.clone()
-        # self.best_eval = status["pop_best_eval"]
 
         self._steps_count += 1
 
@@ -563,6 +562,30 @@ class PoseEstimationProblem(Problem):
             + self.cylinder_weight * cylinder_val
         )
 
+        # # store values to a local file
+        # filename = "./scripts/gp_data.pt"
+        # if not os.path.exists(filename):
+        #     # save the values and losses to a local file
+        #     torch.save({
+        #         "values": values,
+        #         "losses": loss,
+        #         "cTr_batch": cTr_batch,
+        #         "joint_angles": joint_angles,
+        #         "mse": mse,
+        #         "dist": dist,
+        #         "app": app,
+        #         "pts_val": pts_val,
+        #         "cylinder_val": cylinder_val
+        #     }, filename)
+        # else:
+        #     # append the values and losses to the existing file
+        #     data = torch.load(filename)
+        #     data["values"] = torch.cat((data["values"], raw_values), dim=0)
+        #     data["losses"] = torch.cat((data["losses"], loss), dim=0)
+        #     data["cTr_batch"] = torch.cat((data["cTr_batch"], cTr_batch), dim=0)
+        #     data["joint_angles"] = torch.cat((data["joint_angles"], joint_angles), dim=0)
+        #     torch.save(data, filename)
+
         return loss
 
     def _evaluate_batch(self, batch: SolutionBatch) -> SolutionBatch:
@@ -613,6 +636,7 @@ class GradientDescentSearcher(SearchAlgorithm):
         self.optimizer.zero_grad()
 
         loss = self.problem.compute_loss(self.vars).squeeze()
+        # print(self.vars)
 
         loss.backward(retain_graph=True)
 
@@ -858,6 +882,102 @@ class RandomSearcher(SearchAlgorithm):
         self._pop_best = self.batch[best_idx]
 
 
+class ThompsonSamplingSearcher(SearchAlgorithm):
+    def __init__(self, 
+        problem: Problem, 
+        stdev_init = 1., 
+        center_init = None, 
+        popsize = None,
+        *,
+        num_steps=50
+    ):
+        SearchAlgorithm.__init__(
+            self,
+            problem=problem, 
+            pop_best=self._get_pop_best,
+            pop_best_eval=self._get_pop_best_eval,
+        )
+
+        self.sampler = PathwiseSampler(
+            sample_size=popsize,
+            alpha=1e-2,
+            use_keops=True,
+            mean=0.4,
+        )
+        self.num_steps = num_steps
+
+        # Update center init by random sampling
+        with torch.no_grad():
+            dim = self.problem.solution_length
+            candidates = generate_sigma_normal(popsize, dim) + center_init.unsqueeze(0) # shape (popsize, dim)
+            losses = self.problem.compute_loss(candidates)  # shape (popsize,)
+            self.sampler.update_data(candidates, losses, cat=False)
+            self.sampler.draw_posterior_samples()
+
+        # Dummy data for the logger to process
+        self.popsize, self.dim = popsize, problem.solution_length
+        self.batch = self.problem.generate_batch(popsize)
+        self.batch.set_values(candidates.clone())
+        self.batch.set_evals(losses.clone())
+        best_idx = torch.argmin(losses).item()
+        self._pop_best = self.batch[best_idx]
+
+    def _get_pop_best(self):
+        return self._pop_best
+
+    def _get_pop_best_eval(self):
+        return self._pop_best.evals[0].item()
+
+    def _step(self):
+        # x = self._pop_best.values.clone() .repeat(self.popsize, 1).clone().detach().cuda()
+        x_init = self._pop_best.values.clone().unsqueeze(0) + generate_sigma_normal(self.popsize, self.dim)
+        fvals = self.sampler.evaluate(x_init) # shape: [sample_size, 2 * popsize]
+
+        best_indices = torch.argmin(fvals, dim=1)
+        x = x_init[best_indices]
+        x.requires_grad_(True)  # shape: [sample_size, dim]
+
+        with torch.no_grad():
+            best_x = x.clone().detach()  # shape [sample_size, dim]
+            best_loss = fvals[torch.arange(self.popsize), best_indices].clone()  # shape [sample_size]
+
+        optimizer = torch.optim.Adam([x], lr=1.)
+
+        for i in range(self.num_steps):
+            optimizer.zero_grad()
+
+            # Evaluate [sample_size,] loss per function
+            losses = self.sampler.evaluate_optim(x)
+
+            loss = losses.sum()
+
+            loss.backward()
+
+            with torch.no_grad():
+                # Add random perturbation
+                x += generate_sigma_normal(self.popsize, self.dim).to(x.device) * 0.1 * math.exp(-i / self.num_steps)
+
+            optimizer.step()
+
+            # Update best if true objective improved
+            with torch.no_grad():
+                improved = losses < best_loss
+                best_loss[improved] = losses[improved].clone()
+                best_x[improved] = x[improved].clone()
+
+        with torch.no_grad():
+            candidates = best_x.detach()
+            losses = self.problem.compute_loss(candidates)
+            # print(candidates, losses)
+            self.sampler.update_data(candidates, losses)
+            self.sampler.draw_posterior_samples()
+            
+            self.batch.set_values(candidates.clone())
+            self.batch.set_evals(losses.detach().clone())
+            best_idx = torch.argmin(losses).item()
+            self._pop_best = self.batch[best_idx]
+
+
 class Tracker:
     def __init__(
         self, model, robot_renderer, init_cTr, init_joint_angles, 
@@ -904,6 +1024,7 @@ class Tracker:
             "Gradient": GradientDescentSearcher,
             "NelderMead": NelderMeadSearcher,
             "RandomSearch": RandomSearcher,
+            "ThompsonSampling": ThompsonSamplingSearcher,
         }
         self.optimizer = optimizer_dict[searcher]
 
@@ -1025,8 +1146,8 @@ class Tracker:
             popsize=self.args.popsize,
         )
         logger = DummyLogger(searcher, interval=1, after_first_step=False)
-        # logger2 = StdOutLogger(searcher, interval=1, after_first_step=False)
 
+        # Run the searcher for the specified number of iterations
         searcher.run(self.num_iters)
 
         # Extract the best solution and evaluation from the logger

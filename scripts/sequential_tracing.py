@@ -55,7 +55,7 @@ def parseArgs():
     parser.add_argument("--sample_number", type=int, default=200)
     parser.add_argument("--use_nvdiffrast", action="store_true")
     parser.add_argument("--use_bbox_optimizer", action="store_true") # Use XNES for initialization
-    parser.add_argument("--searcher", type=str, default="CMA-ES", choices=["CMA-ES", "XNES", "SNES", "Gradient", "NelderMead", "RandomSearch"])  # Search algorithm to use
+    parser.add_argument("--searcher", type=str, default="CMA-ES", choices=["CMA-ES", "XNES", "SNES", "Gradient", "NelderMead", "RandomSearch", "ThompsonSampling"])  # Search algorithm to use
     parser.add_argument("--online_iters", type=int, default=10)  # Number of iterations for online tracking
     parser.add_argument("--tracking_visualization", action="store_true")  # Whether to visualize the tracking process
     parser.add_argument("--online_lr", type=float, default=1e-3)  # Learning rate for online tracking

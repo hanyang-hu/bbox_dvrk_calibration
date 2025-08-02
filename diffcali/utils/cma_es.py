@@ -128,7 +128,7 @@ class CMAES_cus(CMAES):
         stdev_init: Real = 1.0,
         popsize: Optional[int] = None, 
         center_init: Optional[Vector] = None,
-        c_m: Real = 2.0, # NOTE. Modified to 2.0
+        c_m: Real = 2., # NOTE. Modified to 2.0
         c_sigma: Optional[Real] = None,
         c_sigma_ratio: Real = 1.0,
         damp_sigma: Optional[Real] = None,
@@ -138,7 +138,7 @@ class CMAES_cus(CMAES):
         c_1: Optional[Real] = None,
         c_1_ratio: Real = 1.0,
         c_mu: Optional[Real] = None,
-        c_mu_ratio: Real = 2.0, # NOTE. Modified to 2.0
+        c_mu_ratio: Real = 4.0, # NOTE. Modified to 4.0
         active: bool = True,
         csa_squared: bool = False,
         stdev_min: Optional[Real] = None,
